@@ -1,0 +1,21 @@
+# 依赖
+node_modules/
+
+# Agent 工作空间的产出物：保留目录本身，但不提交 Agent 生成的文件
+workspace/*
+!workspace/.gitkeep
+
+# macOS
+.DS_Store
+
+# 日志
+*.log
+npm-debug.log*
+
+# 环境变量：之后若用 .env 存密钥，务必别提交
+.env
+.env.local
+
+# 编辑器
+.vscode/
+.idea/

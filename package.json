@@ -1,0 +1,14 @@
+{
+  "name": "multiagent-chatroom",
+  "version": "0.1.0",
+  "private": true,
+  "description": "本地多 Agent 协作聊天室：Web 前端 + 常驻后端，复用 minimal-qwen.js / minimal-kimi.js 作为调用层",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.3.0",
+    "ws": "^8.22.2"
+  }
+}
