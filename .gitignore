@@ -5,6 +5,9 @@ node_modules/
 workspace/*
 !workspace/.gitkeep
 
+# 共享记忆落盘：聊天记录可能含敏感内容，绝不提交
+data/
+
 # macOS
 .DS_Store
 

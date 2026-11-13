@@ -189,7 +189,9 @@
     var meta = document.createElement('div');
     meta.className = 'meta';
     var who = isUser ? (msg.sender || ME) : (msg.label || msg.agent);
-    meta.textContent = who + ' · ' + clock(msg.ts) + (msg.ms ? ' · ' + (msg.ms / 1000).toFixed(1) + 's' : '');
+    meta.textContent = who + ' · ' + clock(msg.ts)
+      + (msg.ms ? ' · ' + (msg.ms / 1000).toFixed(1) + 's' : '')
+      + (msg.ctx ? ' · 记忆 ' + msg.ctx + ' 条' : '');
 
     var bubble = document.createElement('div');
     bubble.className = 'bubble';
