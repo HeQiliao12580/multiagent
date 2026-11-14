@@ -5,6 +5,13 @@ node_modules/
 workspace/*
 !workspace/.gitkeep
 
+# 多房间改造：每个房间的工作目录同样是运行时状态
+workspaces/*
+!workspaces/.gitkeep
+
+# 房间注册表：运行时生成，启动时会自建默认房间并按 workspaces/ 目录扫描恢复
+rooms.json
+
 # 共享记忆落盘：聊天记录可能含敏感内容，绝不提交
 data/
 

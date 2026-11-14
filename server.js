@@ -19,6 +19,21 @@ const AGENT_TIMEOUT_MS = Number(process.env.AGENT_TIMEOUT_MS) || 120_000;
 const AGENT_IDLE_MS = Number(process.env.AGENT_IDLE_MS) || 15_000;
 const MAX_HISTORY = 200;
 
+// ---- 多房间改造：路径布局 ----
+// workspaces/<roomId>/        每个房间独立的 Agent 工作目录（cwd 阶段 3 才真正切过去）
+// data/rooms/<roomId>.jsonl   每个房间独立的对话历史
+// rooms.json                  只存房间元数据（id / name / createdAt），不存 messages
+// workspace/                  旧的单房间目录，阶段 5 迁移到 workspaces/room-default
+const WORKSPACES_ROOT = path.join(__dirname, 'workspaces');
+const ROOMS_FILE = path.join(__dirname, 'rooms.json');
+const DATA_DIR = path.join(__dirname, 'data');
+const ROOMS_DATA_DIR = path.join(DATA_DIR, 'rooms');
+const LEGACY_HISTORY_FILE = path.join(DATA_DIR, 'history.jsonl');
+
+const DEFAULT_ROOM_ID = 'room-default';
+// 房间 ID 用 slug（可直接当目录名），严格校验以防 ../ 之类的路径穿越
+const ROOM_ID_RE = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/;
+
 // ---- 共享记忆的注入预算 ----
 // 两个 Agent 都是无状态 CLI（每次调用都是全新会话），所以「记忆」只能靠把对话转录
 // 拼进 prompt。转录越长 token 越多，因此这里给三道闸：条数、单条长度、总长度。
@@ -26,14 +41,10 @@ const MEMORY_MESSAGES = Number(process.env.MEMORY_MESSAGES) || 20; // 最多注�
 const MEMORY_MSG_CHARS = Number(process.env.MEMORY_MSG_CHARS) || 600; // 单条消息截断长度
 const MEMORY_MAX_CHARS = Number(process.env.MEMORY_MAX_CHARS) || 6000; // 转录总长度上限
 
-// 对话历史落盘位置。追加式 JSONL：一行一条消息，崩溃也不会毁掉已写入的部分。
-// 聊天记录可能含敏感内容，务必别提交到 git（.gitignore 里已排除 data/）。
-const DATA_DIR = path.join(__dirname, 'data');
-const HISTORY_FILE = path.join(DATA_DIR, 'history.jsonl');
-
 // Agent 的工作目录，刻意与后端源码隔离。实测：headless 的 auto 审批模式下 Agent 会
 // 对 cwd 里的文件调用 glob / grep_search 等工具，如果 cwd 是项目根目录，它就能读到
-// 甚至改到 server.js 自己。阶段 4 的「共享工作空间」就是这个目录。
+// 甚至改到 server.js 自己。
+// 多房间改造：阶段 1 仍指向旧的单房间目录，阶段 3 才换成 room.workspace。
 const WORKSPACE_DIR = path.join(__dirname, 'workspace');
 
 // Agent 注册表：新增一个 Agent 只要在这里加一行，
@@ -52,51 +63,276 @@ app.get('/api/agents', (_req, res) => {
   res.json(Object.entries(AGENTS).map(([name, a]) => ({ name, label: a.label })));
 });
 
-// 备用入口：不开浏览器也能用 curl 发消息，Agent 回复仍走 WebSocket 广播。
+// ==================== 多房间改造：房间管理 API ====================
+// 只回元数据，不含 messages（历史可能很大，要历史请走 /api/rooms/:id/messages）
+app.get('/api/rooms', (_req, res) => {
+  res.json(
+    [...rooms.values()]
+      .map((r) => ({
+        id: r.id,
+        name: r.name,
+        createdAt: r.createdAt,
+        messageCount: r.messages.length,
+      }))
+      .sort((a, b) => a.createdAt - b.createdAt)
+  );
+});
+
+// body: { name, id? }。不传 id 就从 name 生成 slug；传了就校验后直接用。
+app.post('/api/rooms', (req, res) => {
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+  if (!name) {
+    res.status(400).json({ error: 'name 不能为空' });
+    return;
+  }
+
+  const requested = typeof req.body?.id === 'string' ? req.body.id.trim().toLowerCase() : '';
+  let room;
+  if (requested) {
+    // roomId 会变成目录名，所以必须严格校验，挡掉 ../ 之类的路径穿越
+    if (!ROOM_ID_RE.test(requested)) {
+      res.status(400).json({ error: 'id 非法：只允许小写字母、数字和连字符，不能以连字符开头或结尾' });
+      return;
+    }
+    if (rooms.has(requested)) {
+      res.status(409).json({ error: `房间 ${requested} 已存在` });
+      return;
+    }
+    room = addRoom(requested, name, Date.now());
+    saveRooms();
+    console.log(`[rooms] 新建房间 ${room.id}（${room.name}）-> ${room.workspace}`);
+  } else {
+    room = createRoom(name);
+  }
+
+  res.status(201).json({
+    id: room.id,
+    name: room.name,
+    workspace: room.workspace,
+    createdAt: room.createdAt,
+  });
+});
+
+// 该房间最近 N 条历史；limit 缺省给全部（本身已被 MAX_HISTORY 封顶）
+app.get('/api/rooms/:id/messages', (req, res) => {
+  const room = getRoom(req.params.id);
+  if (!room) {
+    res.status(404).json({ error: `房间 ${req.params.id} 不存在` });
+    return;
+  }
+  const requested = Number(req.query.limit);
+  const limit = Number.isFinite(requested)
+    ? Math.max(1, Math.min(requested, MAX_HISTORY))
+    : MAX_HISTORY;
+  res.json({ roomId: room.id, name: room.name, messages: room.messages.slice(-limit) });
+});
+
+// 备用 HTTP 入口，方便 curl 测试；Agent 回复仍然走 WebSocket 广播到本房间
+app.post('/api/rooms/:id/messages', (req, res) => {
+  const room = getRoom(req.params.id);
+  if (!room) {
+    res.status(404).json({ error: `房间 ${req.params.id} 不存在` });
+    return;
+  }
+  const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+  if (!text) {
+    res.status(400).json({ error: 'text 不能为空' });
+    return;
+  }
+  handleIncoming(room.id, text, typeof req.body?.sender === 'string' ? req.body.sender : 'curl');
+  res.json({ ok: true, roomId: room.id, mentions: parseMentions(text) });
+});
+
+// 多房间改造：旧入口保留做兼容，body 里带 roomId 就发到那个房间，不带就发到默认房间。
 app.post('/api/messages', (req, res) => {
   const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
   if (!text) {
     res.status(400).json({ error: 'text 不能为空' });
     return;
   }
-  handleIncoming(text, typeof req.body?.sender === 'string' ? req.body.sender : 'curl');
-  res.json({ ok: true, mentions: parseMentions(text) });
+  const roomId = typeof req.body?.roomId === 'string' && req.body.roomId ? req.body.roomId : DEFAULT_ROOM_ID;
+  if (!getRoom(roomId)) {
+    res.status(404).json({ error: `房间 ${roomId} 不存在` });
+    return;
+  }
+  handleIncoming(roomId, text, typeof req.body?.sender === 'string' ? req.body.sender : 'curl');
+  res.json({ ok: true, roomId, mentions: parseMentions(text) });
 });
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-// ==================== 消息总线 ====================
-// 常驻服务，历史条数必须有上限，否则内存只涨不落。
-const messages = [];
+// ==================== 多房间改造：房间模型 ====================
+// 内存 Map 是唯一真相源；rooms.json 只存元数据（id/name/workspace/createdAt），
+// 不存 messages —— 历史按房间各存一份 JSONL（data/rooms/<roomId>.jsonl）。
+// room = { id, name, workspace, messages: [], memory: {}, createdAt }
+const rooms = new Map();
 
-function broadcast(event) {
-  const payload = JSON.stringify(event);
+function roomHistoryFile(roomId) {
+  return path.join(ROOMS_DATA_DIR, `${roomId}.jsonl`);
+}
+
+function getRoom(roomId) {
+  return rooms.get(roomId) || null;
+}
+
+// 房间名转 slug。中文名会被剥掉，只剩零星字母（「项目C」-> "c"），
+// 这种没有辨识度的短 slug 不如退化成 room-N，所以要求至少 2 个字符。
+function slugify(name) {
+  const slug = String(name || '')
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 63);
+  return ROOM_ID_RE.test(slug) && slug.length >= 2 ? slug : '';
+}
+
+function generateRoomId(name) {
+  const base = slugify(name);
+  if (base && !rooms.has(base)) return base;
+  if (base) {
+    for (let i = 2; i < 1000; i++) {
+      if (!rooms.has(`${base}-${i}`)) return `${base}-${i}`;
+    }
+  }
+  for (let i = 2; i < 10000; i++) {
+    if (!rooms.has(`room-${i}`)) return `room-${i}`;
+  }
+  throw new Error('房间数量超出上限');
+}
+
+// 写 rooms.json：先写临时文件再 rename。rename 在同一文件系统内是原子的，
+// 所以并发/崩溃时读到的要么是完整旧版、要么是完整新版，绝不会是半个 JSON。
+// 用同步写：Node 单线程内一次写完，天然不会有两个写入互相覆盖。
+function saveRooms() {
+  const meta = [...rooms.values()].map((r) => ({
+    id: r.id,
+    name: r.name,
+    workspace: r.workspace,
+    createdAt: r.createdAt,
+  }));
+  const tmp = ROOMS_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify({ rooms: meta }, null, 2) + '\n');
+  fs.renameSync(tmp, ROOMS_FILE);
+}
+
+// 建房间时就把工作目录建好：Agent 的 cwd 必须是已存在的绝对路径，否则 spawn 直接失败
+function addRoom(id, name, createdAt) {
+  const workspace = path.join(WORKSPACES_ROOT, id);
+  fs.mkdirSync(workspace, { recursive: true });
+  const room = { id, name, workspace, messages: [], memory: {}, createdAt };
+  rooms.set(id, room);
+  return room;
+}
+
+function createRoom(name) {
+  const id = generateRoomId(name);
+  const room = addRoom(id, String(name || '').trim() || id, Date.now());
+  saveRooms();
+  console.log(`[rooms] 新建房间 ${room.id}（${room.name}）-> ${room.workspace}`);
+  return room;
+}
+
+function loadRooms() {
+  let raw = null;
+  try {
+    raw = fs.readFileSync(ROOMS_FILE, 'utf8');
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.error('[rooms] 读取 rooms.json 失败:', err.message);
+  }
+
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      for (const meta of Array.isArray(parsed.rooms) ? parsed.rooms : []) {
+        // 单条记录坏了就跳过它，不能让一行脏数据毁掉所有房间
+        if (!meta || !ROOM_ID_RE.test(String(meta.id))) {
+          console.error('[rooms] 跳过非法房间记录:', JSON.stringify(meta).slice(0, 120));
+          continue;
+        }
+        if (rooms.has(meta.id)) continue;
+        addRoom(meta.id, meta.name || meta.id, meta.createdAt || Date.now());
+      }
+    } catch (err) {
+      console.error('[rooms] rooms.json 解析失败，将按目录扫描重建:', err.message);
+    }
+  }
+
+  // 默认房间必须存在，且不提供删除接口
+  if (!rooms.has(DEFAULT_ROOM_ID)) {
+    addRoom(DEFAULT_ROOM_ID, '默认房间', Date.now());
+  }
+
+  // 目录扫描兜底：workspaces/ 下有目录但 rooms.json 里没登记的，补回来。
+  // 这样即使 rooms.json 被误删，房间和历史（data/rooms/*.jsonl）也不会丢。
+  for (const entry of fs.readdirSync(WORKSPACES_ROOT, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !ROOM_ID_RE.test(entry.name)) continue;
+    if (rooms.has(entry.name)) continue;
+    addRoom(entry.name, entry.name, Date.now());
+    console.log(`[rooms] 从目录扫描补登记房间 ${entry.name}`);
+  }
+
+  saveRooms();
+
+  for (const room of rooms.values()) loadRoomHistory(room);
+}
+
+// 多房间改造：旧的 data/history.jsonl 是单房间时代的全局历史。
+// 如果它还有内容、而 room-default 的历史文件还不存在，就整体搬过去，避免静默丢数据。
+function migrateLegacyHistory() {
+  if (fs.existsSync(roomHistoryFile(DEFAULT_ROOM_ID))) return;
+  let raw;
+  try {
+    raw = fs.readFileSync(LEGACY_HISTORY_FILE, 'utf8');
+  } catch {
+    return; // 没有旧文件，无需迁移
+  }
+  if (!raw.trim()) return;
+  fs.writeFileSync(roomHistoryFile(DEFAULT_ROOM_ID), raw);
+  fs.renameSync(LEGACY_HISTORY_FILE, LEGACY_HISTORY_FILE + '.migrated');
+  console.log(`[rooms] 已把旧的全局历史迁移到 ${DEFAULT_ROOM_ID}（原文件改名为 .migrated 备份）`);
+}
+
+// ==================== 消息总线（按房间） ====================
+// 多房间改造：阶段 1 仍是全局广播，阶段 2 才改成 roomId -> Set<ws> 分组投递。
+// 但事件里已经带上 roomId，前端可以先用它做兜底过滤。
+function broadcast(roomId, event) {
+  const payload = JSON.stringify({ ...event, roomId });
   for (const client of wss.clients) {
     if (client.readyState === client.OPEN) client.send(payload);
   }
 }
 
 // 只有 type=message 的事件进历史；status（思考中/出错）是瞬态的，不落库。
-function publish(event) {
-  if (event.type === 'message') {
-    messages.push(event);
-    if (messages.length > MAX_HISTORY) messages.splice(0, messages.length - MAX_HISTORY);
-    appendHistory(event); // 共享记忆落盘
+function publish(roomId, event) {
+  const room = getRoom(roomId);
+  if (!room) {
+    console.error(`[bus] 房间 ${roomId} 不存在，丢弃 ${event.type} 事件`);
+    return event;
   }
-  broadcast(event);
+  if (event.type === 'message') {
+    // 常驻服务，每个房间的历史各自封顶，否则内存只涨不落
+    room.messages.push(event);
+    if (room.messages.length > MAX_HISTORY) {
+      room.messages.splice(0, room.messages.length - MAX_HISTORY);
+    }
+    appendHistory(room, event); // 该房间的共享记忆落盘
+  }
+  broadcast(roomId, event);
   return event;
 }
 
-// ==================== 共享记忆：持久化 ====================
-function loadHistory() {
+// ==================== 共享记忆：持久化（每房间一份） ====================
+// 多房间改造：从全局单个 history.jsonl 改成 data/rooms/<roomId>.jsonl，
+// 房间 A 的历史绝不会出现在房间 B 的文件里。
+function loadRoomHistory(room) {
   let raw;
   try {
-    raw = fs.readFileSync(HISTORY_FILE, 'utf8');
+    raw = fs.readFileSync(roomHistoryFile(room.id), 'utf8');
   } catch (err) {
-    if (err.code !== 'ENOENT') console.error('[memory] 读取历史失败:', err.message);
-    console.log('[memory] 暂无历史文件，从空记忆开始');
-    return;
+    if (err.code !== 'ENOENT') console.error(`[memory:${room.id}] 读取历史失败:`, err.message);
+    return; // 新房间没有历史文件，从空记忆开始
   }
 
   let bad = 0;
@@ -104,19 +340,23 @@ function loadHistory() {
     if (!line.trim()) continue;
     try {
       const m = JSON.parse(line);
-      if (m && m.type === 'message') messages.push(m);
+      if (m && m.type === 'message') room.messages.push(m);
     } catch {
       bad++; // 半行/损坏行直接跳过，不能让一条坏数据毁掉整份记忆
     }
   }
-  if (messages.length > MAX_HISTORY) messages.splice(0, messages.length - MAX_HISTORY);
-  console.log(`[memory] 载入 ${messages.length} 条历史${bad ? `（跳过 ${bad} 行损坏数据）` : ''}`);
+  if (room.messages.length > MAX_HISTORY) {
+    room.messages.splice(0, room.messages.length - MAX_HISTORY);
+  }
+  console.log(
+    `[memory:${room.id}] 载入 ${room.messages.length} 条历史${bad ? `（跳过 ${bad} 行损坏数据）` : ''}`
+  );
 }
 
-function appendHistory(msg) {
-  fs.appendFile(HISTORY_FILE, JSON.stringify(msg) + '\n', (err) => {
+function appendHistory(room, msg) {
+  fs.appendFile(roomHistoryFile(room.id), JSON.stringify(msg) + '\n', (err) => {
     // 落盘失败不影响聊天，但要吵出来：记忆静默丢失比报错更难查
-    if (err) console.error('[memory] 写入历史失败:', err.message);
+    if (err) console.error(`[memory:${room.id}] 写入历史失败:`, err.message);
   });
 }
 
@@ -134,8 +374,9 @@ function speakerOf(m) {
 
 // 从最新往旧收集，一旦超出总长度上限就停手 —— 这样被牺牲的一定是最旧的内容，
 // 最近的对话（也就是 Agent 最需要的）保证在转录里。
-function renderTranscript() {
-  const recent = messages.slice(-MEMORY_MESSAGES);
+// 多房间改造：转录只取传入房间的 messages，绝不混入其他房间的历史。
+function renderTranscript(room) {
+  const recent = room.messages.slice(-MEMORY_MESSAGES);
   const lines = [];
   let total = 0;
 
@@ -150,8 +391,12 @@ function renderTranscript() {
 }
 
 wss.on('connection', (ws) => {
-  // 新客户端连上先补发历史，刷新页面不会丢上下文
-  ws.send(JSON.stringify({ type: 'history', messages }));
+  // 多房间改造：阶段 1 前端还没有房间概念，一律接到默认房间；
+  // 阶段 2 再改成解析 ws://host/ws?room=<roomId> 并按房间分组投递。
+  const roomId = DEFAULT_ROOM_ID;
+
+  // 新客户端连上先补发本房间历史，刷新页面不会丢上下文
+  ws.send(JSON.stringify({ type: 'history', roomId, messages: getRoom(roomId).messages }));
 
   ws.on('message', (raw) => {
     let data;
@@ -161,14 +406,24 @@ wss.on('connection', (ws) => {
       return; // 非 JSON 帧直接丢弃
     }
     if (data.type === 'chat' && typeof data.text === 'string' && data.text.trim()) {
-      handleIncoming(data.text.trim(), typeof data.sender === 'string' ? data.sender : 'user');
+      handleIncoming(
+        roomId,
+        data.text.trim(),
+        typeof data.sender === 'string' ? data.sender : 'user'
+      );
     }
   });
 });
 
 // ============ 入站消息 → @路由 → Agent 调度 ============
-function handleIncoming(text, sender) {
-  publish({
+// 多房间改造：roomId 从入口一路透传到 publish / buildPrompt，房间之间完全隔离。
+function handleIncoming(roomId, text, sender) {
+  if (!getRoom(roomId)) {
+    console.error(`[router] 房间 ${roomId} 不存在，丢弃这条消息`);
+    return;
+  }
+
+  publish(roomId, {
     id: crypto.randomUUID(),
     type: 'message',
     from: 'user',
@@ -178,18 +433,19 @@ function handleIncoming(text, sender) {
   });
 
   // ---------- 这里是 @路由 ----------
+  // 多房间改造：解析逻辑一行未动，只是作用范围限定在当前房间。
   const targets = parseMentions(text);
 
   if (targets.length === 0) {
-    // 阶段 3 会在这里让「未被 @ 的 Agent」自行评估要不要插话；阶段 1 到此结束。
+    // 「主动感知」（未被 @ 的 Agent 自行评估要不要插话）已按你的决定暂缓，接入点保留在此。
     return;
   }
 
   // 多个 Agent 并发跑、互不 await，所以一个慢不会挡住另一个；
   // 每个调用各自带超时，卡死只影响它自己，不会拖垮后端事件循环。
   for (const name of targets) {
-    dispatchToAgent(name).catch((err) => {
-      console.error(`[dispatch:${name}] 未预期的异常:`, err);
+    dispatchToAgent(roomId, name).catch((err) => {
+      console.error(`[dispatch:${roomId}/${name}] 未预期的异常:`, err);
     });
   }
 }
@@ -205,36 +461,44 @@ function parseMentions(text) {
 }
 
 // 同一个 Agent 同时只允许一个调用在跑。实测：CLI 进程每个约 230MB，且并发打模型
-// 容易触发限流（连发 4 个请求后有 3 个 40s 仍未返回）。阶段 1 直接回「忙」，
+// 容易触发限流（连发 4 个请求后有 3 个 40s 仍未返回）。忙时直接回「忙」，
 // 之后要排队再换成有界队列。
+// 多房间改造：这个闸门刻意保持「全局按 Agent」而不是「按房间按 Agent」——
+// 限流和内存压力是整机资源，不区分房间。若要改成每房间各放行一个，
+// 把 key 换成 `${roomId}:${name}` 即可（代价是 N 个房间就能并发起 N 个 CLI）。
 const running = new Set();
 
 // 注意：不需要把用户原话单独传进来 —— handleIncoming 已经先 publish 了这条消息，
-// 所以它此刻就在 messages 的末尾，会作为转录的最后一行被 Agent 看到。
-async function dispatchToAgent(name) {
+// 所以它此刻就在该房间 messages 的末尾，会作为转录的最后一行被 Agent 看到。
+// 多房间改造：roomId 被闭包捕获，所以即使用户中途切走房间，
+// Agent 的结果仍然会写回发起时的那个房间，不会丢也不会串房（你列的坑 6）。
+async function dispatchToAgent(roomId, name) {
   if (running.has(name)) {
-    console.warn(`[agent:${name}] 正忙，跳过本次调用`);
-    publish({ type: 'status', agent: name, state: 'busy', ts: Date.now() });
+    console.warn(`[agent:${name}] 正忙，跳过 ${roomId} 的本次调用`);
+    publish(roomId, { type: 'status', agent: name, state: 'busy', ts: Date.now() });
     return;
   }
 
   running.add(name);
   const started = Date.now();
-  publish({ type: 'status', agent: name, state: 'thinking', ts: started });
+  publish(roomId, { type: 'status', agent: name, state: 'thinking', ts: started });
 
   // ---------- 这里是记忆注入 ----------
   // 两个 Agent 是无状态 CLI，共享记忆只能靠把对话转录拼进 prompt。
-  const { prompt, ctxCount } = buildPrompt(name);
+  // 多房间改造：只注入当前房间的历史。
+  const { prompt, ctxCount } = buildPrompt(name, getRoom(roomId));
 
   // 调记忆时很有用：DEBUG_PROMPT=1 npm start，就能看到实际拼给 Agent 的完整 prompt
   if (process.env.DEBUG_PROMPT) {
-    console.error(`[prompt:${name}] ${ctxCount} 条历史 / ${prompt.length} 字符\n${prompt}\n[/prompt:${name}]`);
+    console.error(
+      `[prompt:${roomId}/${name}] ${ctxCount} 条历史 / ${prompt.length} 字符\n${prompt}\n[/prompt]`
+    );
   }
 
   try {
     const { text, degraded } = await runAgent(name, prompt);
-    if (degraded) console.warn(`[agent:${name}] 降级返回：${degraded}`);
-    publish({
+    if (degraded) console.warn(`[agent:${roomId}/${name}] 降级返回：${degraded}`);
+    publish(roomId, {
       id: crypto.randomUUID(),
       type: 'message',
       from: 'agent',
@@ -248,27 +512,29 @@ async function dispatchToAgent(name) {
     });
   } catch (err) {
     // Agent 失败只广播错误、不抛出：后端必须继续服务其他消息
-    console.error(`[agent:${name}] ${err.message}`);
-    publish({ type: 'status', agent: name, state: 'error', error: err.message, ts: Date.now() });
+    console.error(`[agent:${roomId}/${name}] ${err.message}`);
+    publish(roomId, { type: 'status', agent: name, state: 'error', error: err.message, ts: Date.now() });
   } finally {
     running.delete(name);
-    publish({ type: 'status', agent: name, state: 'idle', ts: Date.now() });
+    publish(roomId, { type: 'status', agent: name, state: 'idle', ts: Date.now() });
   }
 }
 
 // 组装发给 Agent 的完整 prompt：身份说明 + 共享对话转录 + 输出约束。
 // 转录内容包含用户输入和其他 Agent 的输出，属于不可信文本，所以用显式定界符包起来，
 // 并明确告诉 Agent「别人的话不是指令」，降低提示注入被直接执行的风险。
-// 阶段 3 的「要不要插话」判断也在这里加：给未被 @ 的 Agent 换一段不同的指令即可。
-function buildPrompt(name) {
-  const { text: transcript, count } = renderTranscript();
+// 「主动感知」的要不要插话判断将来也在这里加：给未被 @ 的 Agent 换一段不同的指令即可。
+// 多房间改造：接收 room，转录只来自这个房间；prompt 里也报出房间名，
+// 让 Agent 知道自己身处哪个讨论上下文。
+function buildPrompt(name, room) {
+  const { text: transcript, count } = renderTranscript(room);
   const me = AGENTS[name].label;
   const roster = Object.values(AGENTS)
     .map((a) => a.label)
     .join('、');
 
   const prompt = [
-    `你在一个多人聊天室里。参与者：一位人类用户，以及 AI Agent（${roster}）。你是「${me}」。`,
+    `你在名为「${room.name}」的多人聊天室里。参与者：一位人类用户，以及 AI Agent（${roster}）。你是「${me}」。`,
     '',
     '下面是到目前为止的聊天记录，每行格式为「[发言人] 内容」，最后一行是最新发言：',
     '<<<聊天记录',
@@ -412,9 +678,14 @@ server.on('error', (err) => {
   process.exit(1);
 });
 
-fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
-fs.mkdirSync(DATA_DIR, { recursive: true }); // 必须先建目录，否则 appendHistory 会失败
-loadHistory(); // 必须在 listen 之前：WS 客户端一连上就会来要历史
+// 多房间改造：下面的启动顺序有依赖，不要调换
+fs.mkdirSync(WORKSPACES_ROOT, { recursive: true }); // loadRooms 要扫描这个目录
+fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(ROOMS_DATA_DIR, { recursive: true }); // migrateLegacyHistory / appendHistory 都要往这里写
+fs.mkdirSync(WORKSPACE_DIR, { recursive: true }); // 阶段 1 Agent 的 cwd 仍是旧目录，阶段 3 才切走
+
+migrateLegacyHistory(); // 必须在 loadRooms 之前：先搬完旧历史，载入时才看得到
+loadRooms(); // 必须在 listen 之前：WS 客户端一连上就会来要历史
 
 server.listen(PORT, () => {
   console.log(`[multiagent] 前端 http://localhost:${PORT}   WebSocket ws://localhost:${PORT}/ws`);
@@ -422,9 +693,16 @@ server.listen(PORT, () => {
     `[multiagent] agents=${Object.keys(AGENTS).join(',')}  硬超时=${AGENT_TIMEOUT_MS}ms` +
       `  静默判定=${AGENT_IDLE_MS}ms  node=${process.execPath}`
   );
-  console.log(`[multiagent] Agent 工作空间 ${WORKSPACE_DIR}`);
+  console.log(
+    `[multiagent] 房间 ${rooms.size} 个：${[...rooms.keys()].join(', ')}（默认 ${DEFAULT_ROOM_ID}）`
+  );
+  console.log(`[multiagent] 房间注册表 ${ROOMS_FILE}`);
+  console.log(
+    `[multiagent] 房间工作空间根目录 ${WORKSPACES_ROOT}` +
+      `（阶段 1 Agent cwd 仍为 ${WORKSPACE_DIR}，阶段 3 切成 room.workspace）`
+  );
   console.log(
     `[multiagent] 共享记忆 注入最近 ${MEMORY_MESSAGES} 条 / 单条 ${MEMORY_MSG_CHARS} 字` +
-      ` / 转录上限 ${MEMORY_MAX_CHARS} 字，落盘 ${HISTORY_FILE}`
+      ` / 转录上限 ${MEMORY_MAX_CHARS} 字，落盘 ${ROOMS_DATA_DIR}/<roomId>.jsonl`
   );
 });
