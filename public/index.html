@@ -37,6 +37,18 @@
     border-bottom: 1px solid var(--border);
   }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  /* 多房间改造（阶段 2）：当前房间标签，阶段 4 会换成可切换的下拉框 */
+  .room-tag {
+    font-size: 12px;
+    color: var(--muted);
+    background: #f0f3f7;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 2px 10px;
+    cursor: help;
+    white-space: nowrap;
+  }
+  .room-tag.bad { color: var(--err); background: #fdecea; border-color: #e6a99f; }
   .agents { display: flex; gap: 8px; flex-wrap: wrap; }
   .chip {
     border: 1px solid var(--border);
@@ -130,6 +142,7 @@
 <body>
 <header>
   <h1>Multi-Agent 聊天室</h1>
+  <div id="roomTag" class="room-tag" title="切换房间：改地址栏的 ?room= 参数（阶段 4 会加下拉切换器）">房间：—</div>
   <div id="agents" class="agents"></div>
   <div class="conn"><span id="dot" class="dot"></span><span id="connText">连接中…</span></div>
 </header>
@@ -152,12 +165,18 @@
   var agentsBox = document.getElementById('agents');
   var dot = document.getElementById('dot');
   var connText = document.getElementById('connText');
+  var roomTag = document.getElementById('roomTag');
 
   var ME = 'user';
   var agentNames = [];
   var chips = {};
   var typing = {};   // agentName -> DOM 节点
   var ws = null;
+
+  // 多房间改造（阶段 2）：当前房间来自 URL 的 ?room=，缺省用 room-default。
+  // 断线重连必须沿用这个值，绝不能回退到默认房间（否则重连后就串到别的房间了）。
+  var currentRoom = new URLSearchParams(location.search).get('room') || 'room-default';
+  var roomValid = false;   // 房间不存在时置 false，用来掐掉无意义的重连循环
 
   // 消息文本来自 Agent 子进程，属于不可信输入：先整体转义，再叠加 @高亮
   function escapeHtml(s) {
@@ -246,6 +265,10 @@
   }
 
   function handleEvent(ev) {
+    // 多房间改造（阶段 2）：兜底过滤。后端已经按房间分组投递了，
+    // 但切换房间/重连的瞬间仍可能收到上一个房间的在途事件，这里再挡一道。
+    if (ev.roomId && ev.roomId !== currentRoom) return;
+
     if (ev.type === 'history') {
       log.innerHTML = '';
       (ev.messages || []).forEach(addMessage);
@@ -269,7 +292,9 @@
 
   function connect() {
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(proto + '//' + location.host + '/ws');
+    // 多房间改造（阶段 2）：连的是 currentRoom；断线重连时这个值不变，
+    // 所以不会悄悄退回默认房间。
+    ws = new WebSocket(proto + '//' + location.host + '/ws?room=' + encodeURIComponent(currentRoom));
 
     ws.onopen = function () {
       dot.className = 'dot on';
@@ -283,8 +308,13 @@
     };
     ws.onclose = function () {
       dot.className = 'dot';
-      connText.textContent = '已断开，重连中…';
       sendBtn.disabled = true;
+      // 房间本身不存在就别重连：后端每次都回 400，重连只是无限刷屏
+      if (!roomValid) {
+        connText.textContent = '房间不存在，已停止重连';
+        return;
+      }
+      connText.textContent = '已断开，重连中…';
       setTimeout(connect, 1500);
     };
     ws.onerror = function () { ws.close(); };
@@ -323,8 +353,45 @@
     input.value = '';
   });
 
-  loadAgents();
-  connect();
+  // 多房间改造（阶段 2）：先确认房间存在，再连 WebSocket。
+  // 后端对未知 room 参数直接回 HTTP 400，浏览器那边只能看到「连接失败」，
+  // 讲不清原因，所以这里先查一次 /api/rooms，把错误说明白。
+  function boot() {
+    loadAgents();
+
+    fetch('/api/rooms')
+      .then(function (r) { return r.json(); })
+      .then(function (list) {
+        var found = null;
+        list.forEach(function (r) { if (r.id === currentRoom) found = r; });
+
+        if (!found) {
+          roomValid = false;
+          roomTag.className = 'room-tag bad';
+          roomTag.textContent = '房间不存在：' + currentRoom;
+          dot.className = 'dot';
+          connText.textContent = '未连接';
+          sendBtn.disabled = true;
+          addNote('房间「' + currentRoom + '」不存在。现有房间：'
+            + (list.length ? list.map(function (r) { return r.id; }).join('、') : '（无）')
+            + '。改地址栏的 ?room= 参数即可切换。');
+          return;
+        }
+
+        roomValid = true;
+        roomTag.textContent = '房间：' + found.name + '（' + found.id + '）';
+        document.title = found.name + ' · Multi-Agent 聊天室';
+        input.placeholder = '在「' + found.name + '」里发消息，用 @qwen 或 @kimi 召唤 Agent';
+        connect();
+      })
+      .catch(function (err) {
+        dot.className = 'dot';
+        connText.textContent = '无法获取房间列表';
+        addNote('拉取房间列表失败：' + err.message);
+      });
+  }
+
+  boot();
 })();
 </script>
 </body>

@@ -160,7 +160,38 @@ app.post('/api/messages', (req, res) => {
 });
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
+// 多房间改造（阶段 2）：改用 noServer + 手动 upgrade。
+// 这样才能在握手阶段就用 HTTP 400 拒掉缺失/非法的 room 参数，
+// 而不是先完成连接再踢掉——后者客户端只看到莫名断开，查不出原因。
+const wss = new WebSocketServer({ noServer: true });
+
+// 多房间改造（阶段 2）：roomId -> Set<ws> 订阅表，广播只投递给本房间的客户端
+const roomClients = new Map();
+
+server.on('upgrade', (req, socket, head) => {
+  const { pathname, searchParams } = new URL(req.url, 'http://localhost');
+  if (pathname !== '/ws') {
+    socket.destroy();
+    return;
+  }
+
+  const roomId = searchParams.get('room') || '';
+  if (!ROOM_ID_RE.test(roomId) || !getRoom(roomId)) {
+    socket.write(
+      'HTTP/1.1 400 Bad Request\r\n' +
+        'Content-Type: text/plain; charset=utf-8\r\n' +
+        'Connection: close\r\n\r\n' +
+        `未知或缺失的 room 参数：${roomId || '(空)'}\n`
+    );
+    socket.destroy();
+    console.warn(`[ws] 拒绝握手：room=${roomId || '(空)'} 不是有效房间`);
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req, roomId);
+  });
+});
 
 // ==================== 多房间改造：房间模型 ====================
 // 内存 Map 是唯一真相源；rooms.json 只存元数据（id/name/workspace/createdAt），
@@ -295,11 +326,13 @@ function migrateLegacyHistory() {
 }
 
 // ==================== 消息总线（按房间） ====================
-// 多房间改造：阶段 1 仍是全局广播，阶段 2 才改成 roomId -> Set<ws> 分组投递。
-// 但事件里已经带上 roomId，前端可以先用它做兜底过滤。
+// 多房间改造（阶段 2）：只投递给订阅了该房间的客户端，房间之间彻底互不可见。
+// 事件体仍带 roomId，前端再做一层兜底过滤，防切换瞬间的竞态串消息。
 function broadcast(roomId, event) {
+  const clients = roomClients.get(roomId);
+  if (!clients || clients.size === 0) return; // 没人订阅就不必序列化
   const payload = JSON.stringify({ ...event, roomId });
-  for (const client of wss.clients) {
+  for (const client of clients) {
     if (client.readyState === client.OPEN) client.send(payload);
   }
 }
@@ -390,10 +423,11 @@ function renderTranscript(room) {
   return { text: lines.join('\n'), count: lines.length };
 }
 
-wss.on('connection', (ws) => {
-  // 多房间改造：阶段 1 前端还没有房间概念，一律接到默认房间；
-  // 阶段 2 再改成解析 ws://host/ws?room=<roomId> 并按房间分组投递。
-  const roomId = DEFAULT_ROOM_ID;
+// 多房间改造（阶段 2）：roomId 由 upgrade 握手解析并校验后透传进来，这里无需再判空
+wss.on('connection', (ws, _req, roomId) => {
+  if (!roomClients.has(roomId)) roomClients.set(roomId, new Set());
+  roomClients.get(roomId).add(ws);
+  console.log(`[ws] ${roomId} 新增连接，当前 ${roomClients.get(roomId).size} 个客户端`);
 
   // 新客户端连上先补发本房间历史，刷新页面不会丢上下文
   ws.send(JSON.stringify({ type: 'history', roomId, messages: getRoom(roomId).messages }));
@@ -412,6 +446,16 @@ wss.on('connection', (ws) => {
         typeof data.sender === 'string' ? data.sender : 'user'
       );
     }
+  });
+
+  // 断开时从本房间订阅表移除；集合空了就把 key 删掉，
+  // 否则房间建得越多这个 Map 只涨不落。
+  ws.on('close', () => {
+    const clients = roomClients.get(roomId);
+    if (!clients) return;
+    clients.delete(ws);
+    if (clients.size === 0) roomClients.delete(roomId);
+    console.log(`[ws] ${roomId} 断开连接，剩余 ${clients.size} 个客户端`);
   });
 });
 
@@ -688,7 +732,10 @@ migrateLegacyHistory(); // 必须在 loadRooms 之前：先搬完旧历史，载
 loadRooms(); // 必须在 listen 之前：WS 客户端一连上就会来要历史
 
 server.listen(PORT, () => {
-  console.log(`[multiagent] 前端 http://localhost:${PORT}   WebSocket ws://localhost:${PORT}/ws`);
+  console.log(
+    `[multiagent] 前端 http://localhost:${PORT}/?room=<roomId>` +
+      `   WebSocket ws://localhost:${PORT}/ws?room=<roomId>（缺 room 会回 400）`
+  );
   console.log(
     `[multiagent] agents=${Object.keys(AGENTS).join(',')}  硬超时=${AGENT_TIMEOUT_MS}ms` +
       `  静默判定=${AGENT_IDLE_MS}ms  node=${process.execPath}`
@@ -699,7 +746,7 @@ server.listen(PORT, () => {
   console.log(`[multiagent] 房间注册表 ${ROOMS_FILE}`);
   console.log(
     `[multiagent] 房间工作空间根目录 ${WORKSPACES_ROOT}` +
-      `（阶段 1 Agent cwd 仍为 ${WORKSPACE_DIR}，阶段 3 切成 room.workspace）`
+      `（Agent cwd 目前仍为 ${WORKSPACE_DIR}，阶段 3 才切成 room.workspace）`
   );
   console.log(
     `[multiagent] 共享记忆 注入最近 ${MEMORY_MESSAGES} 条 / 单条 ${MEMORY_MSG_CHARS} 字` +
