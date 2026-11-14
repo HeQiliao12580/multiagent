@@ -1,11 +1,7 @@
 # 依赖
 node_modules/
 
-# Agent 工作空间的产出物：保留目录本身，但不提交 Agent 生成的文件
-workspace/*
-!workspace/.gitkeep
-
-# 多房间改造：每个房间的工作目录同样是运行时状态
+# 多房间：每个房间的工作目录都是运行时状态，不提交 Agent 生成的文件
 workspaces/*
 !workspaces/.gitkeep
 

@@ -1,8 +1,13 @@
 'use strict';
 
-// 阶段 1：常驻后端（HTTP + WebSocket）+ @路由 + Agent 调度器（含超时与错误处理）
-// 阶段 2：共享记忆 —— 对话历史落盘 data/history.jsonl，调用 Agent 时注入转录（见 buildPrompt）
-// 阶段 3 在 handleIncoming 里加主动感知；阶段 4 把 runAgent 的 cwd 换成共享工作空间目录。
+// 常驻后端：HTTP + WebSocket + @路由 + Agent 调度器（超时 / 降级返回 / 进程组清理）
+//
+// 两条路线的阶段编号各自独立，别混：
+//   聊天室路线  1 后端+前端 ✅ / 2 共享记忆 ✅ / 3 主动感知（已暂缓）/ 4 文件读写工具（未做）
+//   多房间路线  1 房间模型+API ✅ / 2 WS 按房间分组 ✅ / 3 Agent cwd 隔离 ✅
+//               / 4 前端房间切换器+新建按钮（未做）/ 5 退役旧 workspace + README ✅
+//
+// 关键位置：@路由 handleIncoming() · 记忆注入 buildPrompt() · Agent 调度 runAgent()
 
 const path = require('node:path');
 const http = require('node:http');
@@ -41,11 +46,10 @@ const MEMORY_MESSAGES = Number(process.env.MEMORY_MESSAGES) || 20; // 最多注�
 const MEMORY_MSG_CHARS = Number(process.env.MEMORY_MSG_CHARS) || 600; // 单条消息截断长度
 const MEMORY_MAX_CHARS = Number(process.env.MEMORY_MAX_CHARS) || 6000; // 转录总长度上限
 
-// Agent 的工作目录，刻意与后端源码隔离。实测：headless 的 auto 审批模式下 Agent 会
-// 对 cwd 里的文件调用 glob / grep_search 等工具，如果 cwd 是项目根目录，它就能读到
-// 甚至改到 server.js 自己。
-// 多房间改造：阶段 1 仍指向旧的单房间目录，阶段 3 才换成 room.workspace。
-const WORKSPACE_DIR = path.join(__dirname, 'workspace');
+// 多房间改造（阶段 3/5）：已不存在全局共享的工作目录，每个 Agent 的 cwd 都是
+// room.workspace（即 workspaces/<roomId>/）。这样既隔离了房间之间的产物，
+// 也依然碰不到后端源码 —— 实测 headless 的 auto 审批模式下 Agent 会主动对 cwd
+// 调用 glob / grep_search 等工具，cwd 绝不能是项目根目录。
 
 // Agent 注册表：新增一个 Agent 只要在这里加一行，
 // @路由、前端的 Agent 芯片列表都会自动跟上。script 必须是「argv[2] 收提示词、
@@ -527,10 +531,14 @@ async function dispatchToAgent(roomId, name) {
   const started = Date.now();
   publish(roomId, { type: 'status', agent: name, state: 'thinking', ts: started });
 
+  // 多房间改造（阶段 3）：room 只取一次，记忆注入和 Agent 的 cwd 都用它，
+  // 避免两处各查一遍 Map 而万一不一致。
+  const room = getRoom(roomId);
+
   // ---------- 这里是记忆注入 ----------
   // 两个 Agent 是无状态 CLI，共享记忆只能靠把对话转录拼进 prompt。
   // 多房间改造：只注入当前房间的历史。
-  const { prompt, ctxCount } = buildPrompt(name, getRoom(roomId));
+  const { prompt, ctxCount } = buildPrompt(name, room);
 
   // 调记忆时很有用：DEBUG_PROMPT=1 npm start，就能看到实际拼给 Agent 的完整 prompt
   if (process.env.DEBUG_PROMPT) {
@@ -540,7 +548,7 @@ async function dispatchToAgent(roomId, name) {
   }
 
   try {
-    const { text, degraded } = await runAgent(name, prompt);
+    const { text, degraded } = await runAgent(room, name, prompt);
     if (degraded) console.warn(`[agent:${roomId}/${name}] 降级返回：${degraded}`);
     publish(roomId, {
       id: crypto.randomUUID(),
@@ -601,13 +609,16 @@ function buildPrompt(name, room) {
 // 只要已经收到文本，静默一段时间后就按现有输出收尾，并把降级原因一并回传。
 const activeChildren = new Set();
 
+// 多房间改造（阶段 3）：接收 room，cwd 指向该房间自己的工作目录。
 // 用 process.execPath 拉起包装脚本，避免子进程的 node 不在 PATH 里（例如 nvm 环境）
-function runAgent(name, prompt) {
+function runAgent(room, name, prompt) {
   const agent = AGENTS[name];
 
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path.join(__dirname, agent.script), prompt], {
-      cwd: WORKSPACE_DIR, // 共享工作空间：Agent 只看得到这里，碰不到后端源码
+      // 每个房间独立的工作目录：Agent 只看得到本房间的文件，
+      // 既隔离了房间之间的产物，也依然碰不到后端源码。
+      cwd: room.workspace,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: process.env, // 子脚本要靠它找到 qwen / kimi 可执行文件
       detached: true, // 独立进程组：超时时能把内层 CLI 一起杀掉，不留孤儿
@@ -726,7 +737,6 @@ server.on('error', (err) => {
 fs.mkdirSync(WORKSPACES_ROOT, { recursive: true }); // loadRooms 要扫描这个目录
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(ROOMS_DATA_DIR, { recursive: true }); // migrateLegacyHistory / appendHistory 都要往这里写
-fs.mkdirSync(WORKSPACE_DIR, { recursive: true }); // 阶段 1 Agent 的 cwd 仍是旧目录，阶段 3 才切走
 
 migrateLegacyHistory(); // 必须在 loadRooms 之前：先搬完旧历史，载入时才看得到
 loadRooms(); // 必须在 listen 之前：WS 客户端一连上就会来要历史
@@ -745,8 +755,7 @@ server.listen(PORT, () => {
   );
   console.log(`[multiagent] 房间注册表 ${ROOMS_FILE}`);
   console.log(
-    `[multiagent] 房间工作空间根目录 ${WORKSPACES_ROOT}` +
-      `（Agent cwd 目前仍为 ${WORKSPACE_DIR}，阶段 3 才切成 room.workspace）`
+    `[multiagent] 房间工作空间根目录 ${WORKSPACES_ROOT}（每个 Agent 的 cwd = 自己房间的目录）`
   );
   console.log(
     `[multiagent] 共享记忆 注入最近 ${MEMORY_MESSAGES} 条 / 单条 ${MEMORY_MSG_CHARS} 字` +
