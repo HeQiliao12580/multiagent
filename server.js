@@ -5,7 +5,7 @@
 // 两条路线的阶段编号各自独立，别混：
 //   聊天室路线  1 后端+前端 ✅ / 2 共享记忆 ✅ / 3 主动感知（已暂缓）/ 4 文件读写工具（未做）
 //   多房间路线  1 房间模型+API ✅ / 2 WS 按房间分组 ✅ / 3 Agent cwd 隔离 ✅
-//               / 4 前端房间切换器+新建按钮（未做）/ 5 退役旧 workspace + README ✅
+//               / 4 前端切换器+新建+删除房间 ✅ / 5 退役旧 workspace + README ✅
 //
 // 关键位置：@路由 handleIncoming() · 记忆注入 buildPrompt() · Agent 调度 runAgent()
 
@@ -129,6 +129,64 @@ app.get('/api/rooms/:id/messages', (req, res) => {
     ? Math.max(1, Math.min(requested, MAX_HISTORY))
     : MAX_HISTORY;
   res.json({ roomId: room.id, name: room.name, messages: room.messages.slice(-limit) });
+});
+
+// 多房间改造（阶段 4）：删除房间。
+// ⚠️ 必须连 workspaces/<id>/ 目录一起删 —— loadRooms 有「按目录扫描补登记」的兜底逻辑，
+// 只从注册表里去掉的话，下次重启这个房间会从目录里复活。
+// 另外「默认房间不能删」这条守卫天然保证了「至少留一个房间」，所以不需要再判一次数量。
+app.delete('/api/rooms/:id', (req, res) => {
+  const roomId = req.params.id;
+  const room = getRoom(roomId);
+  if (!room) {
+    res.status(404).json({ error: `房间 ${roomId} 不存在` });
+    return;
+  }
+  if (roomId === DEFAULT_ROOM_ID) {
+    res.status(403).json({ error: `默认房间 ${DEFAULT_ROOM_ID} 不能删除` });
+    return;
+  }
+  // 有 Agent 正在这个房间里跑时不删：否则它的工作目录会在脚下被抽掉，
+  // 结果也会因为房间已不存在而被丢弃，白烧一次模型调用。
+  if (inFlightByRoom.has(roomId)) {
+    res.status(409).json({ error: `房间 ${roomId} 有 Agent 正在运行，请等它结束后再删` });
+    return;
+  }
+
+  // 先断开本房间的 WS 连接，4001 是自定义码，前端据此判定「房间没了」而不是网络抖动，
+  // 从而停止重连（否则会对一个已删除的房间无限重试，每次都被 400 拒绝）
+  const clients = roomClients.get(roomId);
+  if (clients) {
+    for (const client of clients) {
+      try { client.close(4001, 'room deleted'); } catch { /* 已经断了 */ }
+    }
+    roomClients.delete(roomId);
+  }
+
+  rooms.delete(roomId);
+  saveRooms();
+
+  const errors = [];
+  try {
+    fs.rmSync(roomHistoryFile(roomId), { force: true });
+  } catch (err) {
+    errors.push(`历史文件: ${err.message}`);
+  }
+  try {
+    fs.rmSync(room.workspace, { recursive: true, force: true });
+  } catch (err) {
+    errors.push(`工作目录: ${err.message}`);
+  }
+
+  if (errors.length) {
+    // 注册表已经改了，磁盘清理没干净 —— 如实报 500，别假装成功
+    console.error(`[rooms] 删除 ${roomId} 时部分失败:`, errors.join('; '));
+    res.status(500).json({ error: `房间已注销，但磁盘清理未完成：${errors.join('; ')}` });
+    return;
+  }
+
+  console.log(`[rooms] 已删除房间 ${roomId}（含历史与工作目录）`);
+  res.json({ ok: true, deleted: roomId, remaining: rooms.size });
 });
 
 // 备用 HTTP 入口，方便 curl 测试；Agent 回复仍然走 WebSocket 广播到本房间
@@ -516,6 +574,11 @@ function parseMentions(text) {
 // 把 key 换成 `${roomId}:${name}` 即可（代价是 N 个房间就能并发起 N 个 CLI）。
 const running = new Set();
 
+// 多房间改造（阶段 4）：按房间统计在跑的 Agent 调用数。
+// DELETE /api/rooms/:id 用它挡住「Agent 正在跑就删房间」——否则工作目录会在
+// Agent 脚下被抽掉，结果也会因房间已不存在而被丢弃。
+const inFlightByRoom = new Map();
+
 // 注意：不需要把用户原话单独传进来 —— handleIncoming 已经先 publish 了这条消息，
 // 所以它此刻就在该房间 messages 的末尾，会作为转录的最后一行被 Agent 看到。
 // 多房间改造：roomId 被闭包捕获，所以即使用户中途切走房间，
@@ -528,6 +591,7 @@ async function dispatchToAgent(roomId, name) {
   }
 
   running.add(name);
+  inFlightByRoom.set(roomId, (inFlightByRoom.get(roomId) || 0) + 1);
   const started = Date.now();
   publish(roomId, { type: 'status', agent: name, state: 'thinking', ts: started });
 
@@ -568,6 +632,9 @@ async function dispatchToAgent(roomId, name) {
     publish(roomId, { type: 'status', agent: name, state: 'error', error: err.message, ts: Date.now() });
   } finally {
     running.delete(name);
+    const left = (inFlightByRoom.get(roomId) || 1) - 1;
+    if (left > 0) inFlightByRoom.set(roomId, left);
+    else inFlightByRoom.delete(roomId);
     publish(roomId, { type: 'status', agent: name, state: 'idle', ts: Date.now() });
   }
 }

@@ -37,18 +37,34 @@
     border-bottom: 1px solid var(--border);
   }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
-  /* 多房间改造（阶段 2）：当前房间标签，阶段 4 会换成可切换的下拉框 */
-  .room-tag {
-    font-size: 12px;
-    color: var(--muted);
-    background: #f0f3f7;
+  /* 多房间改造（阶段 4）：房间切换器 */
+  .rooms { display: flex; align-items: center; gap: 6px; }
+  #roomSelect {
+    font: inherit;
+    font-size: 13px;
+    padding: 3px 8px;
     border: 1px solid var(--border);
     border-radius: 6px;
-    padding: 2px 10px;
-    cursor: help;
+    background: #fff;
+    color: var(--text);
+    max-width: 220px;
+  }
+  #roomSelect:focus { outline: 2px solid rgba(47, 111, 235, .35); }
+  .mini {
+    font: inherit;
+    font-size: 12px;
+    padding: 3px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: #fafbfc;
+    color: var(--muted);
+    cursor: pointer;
     white-space: nowrap;
   }
-  .room-tag.bad { color: var(--err); background: #fdecea; border-color: #e6a99f; }
+  .mini:hover { border-color: var(--accent); color: var(--accent); }
+  .mini.danger:hover { border-color: var(--err); color: var(--err); }
+  .mini:disabled { opacity: .4; cursor: default; }
+  .mini:disabled:hover { border-color: var(--border); color: var(--muted); }
   .agents { display: flex; gap: 8px; flex-wrap: wrap; }
   .chip {
     border: 1px solid var(--border);
@@ -142,7 +158,11 @@
 <body>
 <header>
   <h1>Multi-Agent 聊天室</h1>
-  <div id="roomTag" class="room-tag" title="切换房间：改地址栏的 ?room= 参数（阶段 4 会加下拉切换器）">房间：—</div>
+  <div class="rooms">
+    <select id="roomSelect" title="切换房间"></select>
+    <button id="newRoomBtn" type="button" class="mini" title="新建房间">＋ 新建</button>
+    <button id="delRoomBtn" type="button" class="mini danger" title="删除当前房间（默认房间不可删）">删除</button>
+  </div>
   <div id="agents" class="agents"></div>
   <div class="conn"><span id="dot" class="dot"></span><span id="connText">连接中…</span></div>
 </header>
@@ -165,17 +185,22 @@
   var agentsBox = document.getElementById('agents');
   var dot = document.getElementById('dot');
   var connText = document.getElementById('connText');
-  var roomTag = document.getElementById('roomTag');
+  // 多房间改造（阶段 4）：房间切换器
+  var roomSelect = document.getElementById('roomSelect');
+  var newRoomBtn = document.getElementById('newRoomBtn');
+  var delRoomBtn = document.getElementById('delRoomBtn');
 
   var ME = 'user';
+  var DEFAULT_ROOM = 'room-default';
   var agentNames = [];
   var chips = {};
   var typing = {};   // agentName -> DOM 节点
+  var rooms = [];    // /api/rooms 的缓存
   var ws = null;
 
   // 多房间改造（阶段 2）：当前房间来自 URL 的 ?room=，缺省用 room-default。
   // 断线重连必须沿用这个值，绝不能回退到默认房间（否则重连后就串到别的房间了）。
-  var currentRoom = new URLSearchParams(location.search).get('room') || 'room-default';
+  var currentRoom = new URLSearchParams(location.search).get('room') || DEFAULT_ROOM;
   var roomValid = false;   // 房间不存在时置 false，用来掐掉无意义的重连循环
 
   // 消息文本来自 Agent 子进程，属于不可信输入：先整体转义，再叠加 @高亮
@@ -306,10 +331,23 @@
       try { ev = JSON.parse(e.data); } catch (_) { return; }
       handleEvent(ev);
     };
-    ws.onclose = function () {
+    ws.onclose = function (ev) {
       dot.className = 'dot';
       sendBtn.disabled = true;
-      // 房间本身不存在就别重连：后端每次都回 400，重连只是无限刷屏
+
+      // 4001 是后端自定义码，含义是「这个房间已被删除」（可能在别的窗口删的）。
+      // 这时重连毫无意义——后端会对已不存在的房间一直回 400——所以直接回默认房间。
+      if (ev && ev.code === 4001) {
+        roomValid = false;
+        connText.textContent = '房间已被删除';
+        addNote('当前房间已被删除，正在回到默认房间…');
+        setTimeout(function () {
+          refreshRooms().then(function () { switchRoom(DEFAULT_ROOM, true); });
+        }, 1000);
+        return;
+      }
+
+      // 房间本身不存在也别重连：后端每次都回 400，重连只是无限刷屏
       if (!roomValid) {
         connText.textContent = '房间不存在，已停止重连';
         return;
@@ -353,35 +391,175 @@
     input.value = '';
   });
 
-  // 多房间改造（阶段 2）：先确认房间存在，再连 WebSocket。
-  // 后端对未知 room 参数直接回 HTTP 400，浏览器那边只能看到「连接失败」，
-  // 讲不清原因，所以这里先查一次 /api/rooms，把错误说明白。
+  // ==================== 多房间改造（阶段 4）：房间管理 ====================
+
+  function loadRooms() {
+    return fetch('/api/rooms').then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+
+  function refreshRooms() {
+    return loadRooms().then(function (list) {
+      rooms = list;
+      renderRoomSelect();
+      return list;
+    });
+  }
+
+  function renderRoomSelect() {
+    roomSelect.innerHTML = '';
+    rooms.forEach(function (r) {
+      var opt = document.createElement('option');
+      opt.value = r.id;
+      // 名字和 id 一样就只显示一次，避免出现 "proj-a（proj-a）" 这种噪音
+      opt.textContent = r.name === r.id ? r.id : r.name + '（' + r.id + '）';
+      roomSelect.appendChild(opt);
+    });
+    roomSelect.value = currentRoom;
+  }
+
+  // 标签页标题、输入框提示、删除按钮可用性都跟着当前房间走
+  function applyRoomChrome() {
+    var found = null;
+    rooms.forEach(function (r) { if (r.id === currentRoom) found = r; });
+    var label = found ? found.name : currentRoom;
+    document.title = label + ' · Multi-Agent 聊天室';
+    input.placeholder = '在「' + label + '」里发消息，用 @qwen 或 @kimi 召唤 Agent';
+    delRoomBtn.disabled = (currentRoom === DEFAULT_ROOM);
+    roomSelect.value = currentRoom;
+  }
+
+  // 切房间必须先主动关掉旧连接：否则旧房间的在途事件还会往这个页面推，
+  // 而且旧连接的 onclose 会触发重连，等于同时挂着两个房间。
+  function switchRoom(roomId, force) {
+    if (roomId === currentRoom && !force) return;
+    dropSocket();
+    currentRoom = roomId;
+    roomValid = true;
+    history.replaceState(null, '', '?room=' + encodeURIComponent(roomId));
+    log.innerHTML = '';
+    typing = {};
+    // 上一个房间遗留的「思考中」状态要清掉，否则芯片会一直显示忙
+    Object.keys(chips).forEach(function (k) { chips[k].className = 'chip'; });
+    connText.textContent = '连接中…';
+    applyRoomChrome();
+    connect();
+  }
+
+  // 摘掉 onclose 再关闭：这次关闭是我们主动的，不该被当成断线而触发重连
+  function dropSocket() {
+    if (!ws) return;
+    var old = ws;
+    ws = null;
+    old.onclose = null;
+    try { old.close(); } catch (_) {}
+  }
+
+  // 与后端 slugify 保持一致，只用来判断「中文名要不要额外问一个 ID」
+  function slugify(name) {
+    var s = String(name).toLowerCase().trim()
+      .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 63);
+    return (/^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/.test(s) && s.length >= 2) ? s : '';
+  }
+
+  function api(method, url, body) {
+    return fetch(url, {
+      method: method,
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined
+    }).then(function (r) {
+      return r.json().then(
+        function (j) { return { ok: r.ok, status: r.status, body: j }; },
+        function () { return { ok: r.ok, status: r.status, body: {} }; }
+      );
+    });
+  }
+
+  function createRoom() {
+    var name = window.prompt('新房间的名称（显示用，可以是中文）：');
+    if (name === null) return;
+    name = name.trim();
+    if (!name) { addNote('房间名不能为空'); return; }
+
+    var payload = { name: name };
+    // 纯中文名剥掉 CJK 后 slug 就空了，后端只能退化成 room-N，所以这里让用户自己定 ID
+    if (!slugify(name)) {
+      var id = window.prompt('中文名没法自动生成 ID，请给一个英文 ID（小写字母 / 数字 / 连字符）：');
+      if (id === null) return;
+      id = id.trim().toLowerCase();
+      // 已经合法就原样用；否则规范化一次（"Proj C" -> "proj-c"），省得被后端 400 打回
+      var clean = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/.test(id) ? id : slugify(id);
+      if (!clean) {
+        addNote('ID 非法：只允许小写字母、数字和连字符，且不能以连字符开头或结尾');
+        return;
+      }
+      payload.id = clean;
+    }
+
+    api('POST', '/api/rooms', payload).then(function (res) {
+      if (!res.ok) {
+        addNote('新建房间失败（HTTP ' + res.status + '）：' + (res.body.error || '未知错误'));
+        return;
+      }
+      return refreshRooms().then(function () { switchRoom(res.body.id, true); });
+    }).catch(function (e) { addNote('新建房间失败：' + e.message); });
+  }
+
+  function deleteRoom() {
+    if (currentRoom === DEFAULT_ROOM) return;
+    var sure = window.confirm(
+      '确定删除房间「' + currentRoom + '」？\n\n'
+      + '会一并删除：\n'
+      + '  · 该房间的全部聊天历史\n'
+      + '  · workspaces/' + currentRoom + '/ 目录下的所有文件\n\n'
+      + '不可恢复。'
+    );
+    if (!sure) return;
+
+    // 先自己断开：后端删除时会用 4001 关掉本房间连接，那条路径也会触发「回默认房间」，
+    // 不先摘掉就会和下面这次主动切换撞车，结果同时开两条连接。
+    dropSocket();
+    roomValid = false;
+
+    api('DELETE', '/api/rooms/' + encodeURIComponent(currentRoom)).then(function (res) {
+      if (!res.ok) {
+        addNote('删除失败（HTTP ' + res.status + '）：' + (res.body.error || '未知错误'));
+        roomValid = true;
+        connect(); // 删除没成功，人还留在这个房间，把连接接回来
+        return;
+      }
+      return refreshRooms().then(function () { switchRoom(DEFAULT_ROOM, true); });
+    }).catch(function (e) {
+      addNote('删除失败：' + e.message);
+      roomValid = true;
+      connect();
+    });
+  }
+
+  roomSelect.addEventListener('change', function () { switchRoom(roomSelect.value); });
+  newRoomBtn.addEventListener('click', createRoom);
+  delRoomBtn.addEventListener('click', deleteRoom);
+
   function boot() {
     loadAgents();
 
-    fetch('/api/rooms')
-      .then(function (r) { return r.json(); })
+    refreshRooms()
       .then(function (list) {
-        var found = null;
-        list.forEach(function (r) { if (r.id === currentRoom) found = r; });
+        var exists = false;
+        list.forEach(function (r) { if (r.id === currentRoom) exists = true; });
 
-        if (!found) {
-          roomValid = false;
-          roomTag.className = 'room-tag bad';
-          roomTag.textContent = '房间不存在：' + currentRoom;
-          dot.className = 'dot';
-          connText.textContent = '未连接';
-          sendBtn.disabled = true;
-          addNote('房间「' + currentRoom + '」不存在。现有房间：'
-            + (list.length ? list.map(function (r) { return r.id; }).join('、') : '（无）')
-            + '。改地址栏的 ?room= 参数即可切换。');
-          return;
+        // URL 指向的房间不存在时不要死连（后端会一直回 400），落回默认房间
+        if (!exists) {
+          addNote('房间「' + currentRoom + '」不存在，已回到默认房间。');
+          currentRoom = DEFAULT_ROOM;
+          history.replaceState(null, '', '?room=' + encodeURIComponent(currentRoom));
         }
 
         roomValid = true;
-        roomTag.textContent = '房间：' + found.name + '（' + found.id + '）';
-        document.title = found.name + ' · Multi-Agent 聊天室';
-        input.placeholder = '在「' + found.name + '」里发消息，用 @qwen 或 @kimi 召唤 Agent';
+        log.innerHTML = '';
+        applyRoomChrome();
         connect();
       })
       .catch(function (err) {

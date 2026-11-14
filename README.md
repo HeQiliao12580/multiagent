@@ -78,6 +78,7 @@ multiagent/
 | GET | `/api/agents` | Agent 列表 `[{name,label}]` |
 | GET | `/api/rooms` | 房间列表（含 `messageCount`，不含消息体） |
 | POST | `/api/rooms` | 建房间，body `{name, id?}` → `201` |
+| DELETE | `/api/rooms/:id` | 删房间（含历史与工作目录）→ `200` |
 | GET | `/api/rooms/:id/messages?limit=N` | 该房间最近 N 条历史 |
 | POST | `/api/rooms/:id/messages` | 向该房间发消息，body `{text, sender?}` |
 | POST | `/api/messages` | **兼容入口**，body `{text, sender?, roomId?}`；不带 `roomId` 落 `room-default` |
@@ -96,13 +97,33 @@ curl -s -X POST localhost:3000/api/rooms \
 - 不传 `id` 时从 `name` 生成 slug；**纯中文名的 slug 会被剥光**，短于 2 字符时退化成 `room-N`，
   所以中文名建议显式指定 `id`
 - 重复 id → `409`；非法 id / 空 name → `400`；房间不存在 → `404`
-- 目前**没有删除房间的接口**。要删得停服务后手动：删 `workspaces/<id>/`、
-  删 `data/rooms/<id>.jsonl`、从 `rooms.json` 里去掉该条，再重启
-- 默认房间 `room-default` 不可删，启动时保证存在
+- 默认房间 `room-default` 不可删，启动时保证存在。这条守卫天然保证了「至少留一个房间」，
+  所以删除接口没有再单独判数量
 - **`rooms.json` 被删也不会丢房间**：启动时会扫描 `workspaces/` 下的目录名把房间补登记回来，
   历史文件也还在（实测 3 个房间 + 全部历史完整恢复）。但兜底恢复**只能还原 id**——
   显示名会退化成 id、`createdAt` 会重置为当前时间（`room-default` 例外，它的名字是硬编码的）。
   所以这是防误删的保险，不是备份手段
+
+### 删除房间
+
+```bash
+curl -s -X DELETE localhost:3000/api/rooms/proj-a
+```
+
+`DELETE` 会一并清除三处状态：注册表条目、`data/rooms/<id>.jsonl`、`workspaces/<id>/` 整个目录，
+**不可恢复**。必须连目录一起删——启动时有「按 `workspaces/` 目录扫描补登记」的兜底逻辑，
+只注销不删目录的话，下次重启这个房间会复活（已实测确认删干净后不会复活）。
+
+| 情况 | 响应 |
+|---|---|
+| 房间不存在 | `404` |
+| 删的是 `room-default` | `403` |
+| 该房间有 Agent 正在跑 | `409`——避免工作目录在 Agent 脚下被抽掉、结果又因房间已不存在而被丢弃 |
+| 磁盘清理失败 | `500`，注册表已改但如实报错，不假装成功 |
+
+删除成功时服务端用自定义关闭码 **4001** 主动断开该房间的所有 WebSocket 连接；
+前端据此判定「房间没了」而不是网络抖动，从而停止重连并自动回到 `room-default`
+（否则会对一个已不存在的房间无限重试，每次都被 400 拒绝）。
 
 ---
 
@@ -115,6 +136,8 @@ ws://localhost:3000/ws?room=<roomId>
 - **`room` 参数必填**。缺失或指向不存在的房间，握手阶段直接回 **HTTP 400**
   （不会先连上再踢，那样客户端只看到莫名断开）
 - 连接成功后服务端立刻推一条 `history` 事件，携带该房间全部历史
+- 房间被删除时，服务端用自定义关闭码 **4001**（reason `room deleted`）断开该房间的所有连接，
+  客户端应据此停止重连
 
 ### 事件格式
 
@@ -144,15 +167,29 @@ ws://localhost:3000/ws?room=<roomId>
 
 ## 前端
 
-打开 `http://localhost:3000/?room=<roomId>`，不带参数即 `room-default`。
+打开 `http://localhost:3000/`，不带参数即进 `room-default`；
+也可以直接指定 `http://localhost:3000/?room=proj-a`。
 
-- 顶栏显示当前房间名，标签页标题同步更新
-- 房间不存在时显示红标提示 + 可用房间列表，并**停止重连**（否则会无限重试被 400 拒绝的连接）
+### 房间管理（顶栏）
+
+- **下拉框切换房间**：切换时关掉旧 WebSocket → 用新 roomId 重连 → 清空消息区 →
+  由 `history` 事件重新渲染该房间历史。地址栏的 `?room=` 同步更新，刷新后仍在原房间
+- **＋ 新建**：填名称即可。英文名会自动生成 slug 作为 ID；**纯中文名会再弹一次输入框
+  要你补一个英文 ID**（CJK 被剥掉后 slug 就空了，后端只能退化成 `room-N`）。建好自动切进去
+- **删除**：仅对非默认房间可用。二次确认会写明将删除该房间的历史和 `workspaces/<id>/`
+  下所有文件。删完自动回到 `room-default`
+
+### 连接与容错
+
 - 断线自动重连，**沿用当前 roomId**，不会退回默认房间
+- URL 指向的房间不存在时提示并落回 `room-default`，不会对着 400 死连
+- 收到关闭码 `4001`（房间被别的窗口删掉了）时停止重连并回到默认房间
 - 事件按 `roomId` 兜底过滤，防切换瞬间的在途消息串房
+- 切房间时清掉上一个房间遗留的「思考中」芯片状态
 - Agent 输出属于不可信内容，渲染前先整体 HTML 转义，再叠加 `@mention` 高亮
 
-**切换房间目前靠改 URL；「新建房间」按钮还没做**（多房间路线阶段 4）。
+⚠️ 改完前端记得**硬刷新**（Cmd+Shift+R），否则跑的还是旧 JS——
+旧版前端连 `/ws` 不带 `room` 参数，会被 400 拒绝并每 1.5s 重试一次。
 
 ---
 
@@ -256,5 +293,5 @@ LLM 分类器会自动放行它认为安全的操作。实测一句"一起看看
 - ✅ 阶段 1：房间模型 + 管理 API
 - ✅ 阶段 2：WebSocket 按房间分组投递
 - ✅ 阶段 3：Agent cwd 切到 `room.workspace`
-- ⬜ 阶段 4：前端房间切换器 + 新建房间按钮
+- ✅ 阶段 4：前端房间下拉切换器 + 新建房间 + 删除房间（含 `DELETE /api/rooms/:id`）
 - ✅ 阶段 5：退役旧的单一 `workspace/`、补 README
