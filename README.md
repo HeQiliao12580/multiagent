@@ -294,6 +294,28 @@ Agent 不再硬编码在 `server.js`，而是存在 **`agents.json`**（已 giti
 - **禁用 ≠ 删除**：禁用立即从 @ 清单、路由、前端芯片里消失，正在跑的调用不受影响
 - 同伴清单动态生成（所有 enabled 且非自己）；循环控制只看 `depth`，与 Agent 数量无关
 
+### 换用其他 CLI（claude / gemini / …）
+
+`SCRIPTS` 只是白名单（id → 仓库内相对路径），改它**不会凭空产生调用脚本**。完整步骤：
+
+1. **写 wrapper 脚本**，例如 `minimal-claude.js`，满足调用层契约：
+   `argv[2]` 收提示词、回复写 stdout、诊断写 stderr、成功退出码 0。
+   ⚠️ 每个 CLI 的流式格式都不一样，wrapper 要各自适配。qwen 是
+   `--output-format stream-json`，且必须在收到 `result` 事件时主动 SIGKILL
+   （它发完 result 还会被 auto-memory 任务吊住 90s+，见「已知坑 1」）。
+   照抄 `minimal-qwen.js` 的结构、只改事件解析部分是最快的路。
+2. **在 `server.js` 的 `SCRIPTS` 里登记** `{ id, path, description }`，然后重启后端。
+3. 界面上「⚙ Agent 管理 → ＋ 新增 Agent」，script 下拉里就能选到新 id。
+4. CLI 二进制必须在 PATH 里（或在 wrapper 里写绝对路径）。nvm、`~/.local/bin` 这类路径
+   在非交互式 shell 里通常不在 PATH，cron / launchd 场景要显式导出。
+
+本地缺某个 CLI **不会让服务崩溃**：spawn 报 ENOENT → 该次调用以 error 状态广播、
+「测试连接」显示"无法启动脚本"，其他 Agent 不受影响。
+
+`agents.json` 的种子配置按 `SCRIPTS` 动态生成：id 在内置富 prompt 库里（目前只有
+qwen / kimi）就用调教过的版本，否则用 coordinator 模板生成最小可用种子，
+`SCRIPTS` 为空时注册表也允许为空、靠界面从零添加。所以把 SCRIPTS 整体换掉也能正常启动。
+
 ---
 
 ## Agent 协作（互 @）

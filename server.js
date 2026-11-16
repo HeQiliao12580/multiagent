@@ -34,6 +34,10 @@ const AGENT_TIMEOUT_MS = Number(process.env.AGENT_TIMEOUT_MS) || 300_000;
 // minimal-qwen.js 里根治（收到 result 就 SIGKILL），所以现在它只是安全网，
 // 放宽到 60s 换来不误杀，代价可控（真挂死时最多多等 60s，且还有硬超时兜底）。
 const AGENT_IDLE_MS = Number(process.env.AGENT_IDLE_MS) || 60_000;
+// Agent 管理：测试连接的超时。原始规格写 10s，但实测 qwen 冷启动 + 思考经常要 14~42s，
+// 10s 会把一个完全正常的脚本误判成卡死 —— 而测试不过又会挡住保存按钮，等于没法新增 Agent。
+// 改成可配置、默认 60s：仍然有界（坑 3 的目的达到），但不会误杀慢 CLI。
+const AGENT_TEST_TIMEOUT_MS = Number(process.env.AGENT_TEST_TIMEOUT_MS) || 60_000;
 const MAX_HISTORY = 200;
 
 // ---- 多房间改造：路径布局 ----
@@ -131,45 +135,66 @@ function agentLabel(name) {
 
 // Agent 管理：种子配置。role 按实际职责标 —— qwen 分发+质检 = coordinator，kimi 实施 = executor。
 // systemPrompt 沿用改造前调好的版本（不是通用模板），保证迁移后行为不变。
+// Agent 管理（换 CLI 支持）：这些富 prompt 按 **script id** 存放在内置库里，
+// 只有调教过的 CLI 才有；defaultAgents() 会按 SCRIPTS 动态取用，
+// 所以把 SCRIPTS 换成 claude/gemini 也不会再出现「种子引用了不存在的 script」而崩。
+const BUILTIN_AGENT_PROMPTS = {
+  qwen: {
+    description: '任务分发与质量检查。擅长拆解需求、判断任务该由谁做、审查产出是否达标。',
+    role: 'coordinator',
+    systemPrompt: [
+      '你是猫咖里的 qwen，负责任务分发和质量检查。',
+      '你的职责：',
+      '1. 理解用户需求，判断是需要你直接回答，还是派给 kimi 实施。',
+      '2. 需要实际动手执行（写代码、改文件、生成文档、跑命令）时，在回复行首 @kimi 派活，并写清楚具体要求。',
+      '3. kimi 交回结果后，你负责检查：达标就总结给用户；不达标就在行首 @kimi 说明要改什么。',
+      '4. 你自己不直接做实施类工作，实施交给 kimi。',
+      '5. 不需要 kimi 时（纯问答、纯分析），直接回复用户，不要写 @。',
+      '6. 检查 kimi 的产出时必须给出明确结论：「通过」/「不通过」/「具体要改什么」。只复述 kimi 说过的话等于没检查。',
+    ].join('\n'),
+    handoffExample:
+      '@kimi 请实现 login() 函数，要求支持邮箱和手机号两种登录方式，写完告诉我改了哪些文件。',
+  },
+  kimi: {
+    description: '具体实施。擅长按明确要求写代码、改文件、生成文档、执行操作。',
+    role: 'executor',
+    systemPrompt: [
+      '你是猫咖里的 kimi，负责具体实施。',
+      '你的职责：',
+      '1. 收到 qwen 或用户的具体要求后，动手完成（写代码、改文件、生成文档等）。',
+      '2. 实施完成后，在回复行首 @qwen 交活，简要说明做了什么、改了哪些文件、有什么需要注意的。',
+      '3. 如果需求有歧义、缺信息、或实施中遇到无法自行决策的问题，在行首 @qwen 请示，不要自行猜测。',
+      '4. 如果你是被用户直接 @ 的，实施完成后同样 @qwen 交活，让 qwen 检查。',
+      '5. 不需要 qwen 检查时（例如用户明确说“不用检查，直接给我”），不要写 @。',
+      '6. 交活时必须写清三件事：做了什么、改了哪些文件、有什么需要注意的。只回一句「完成了」会让 qwen 没法检查，也会被打回重做。',
+    ].join('\n'),
+    handoffExample:
+      '@qwen login() 已实现，支持邮箱和手机号两种登录方式；改动了 src/auth.js 和 src/auth.test.js，需要注意手机号分支的单测还没补。',
+  },
+};
+
+// Agent 管理：按 SCRIPTS 动态生成种子。
+//   - script id 在内置库里有富 prompt 就用它（qwen/kimi 迁移后行为不变）
+//   - 没有就用 coordinator 模板生成一个最小可用种子，让服务至少能起来，
+//     用户再去管理面板改角色和 prompt
+//   - SCRIPTS 为空时返回空种子：注册表允许为空，靠界面从零添加
 function defaultAgents() {
-  return {
-    qwen: {
-      description: '任务分发与质量检查。擅长拆解需求、判断任务该由谁做、审查产出是否达标。',
-      role: 'coordinator',
-      systemPrompt: [
-        '你是猫咖里的 qwen，负责任务分发和质量检查。',
-        '你的职责：',
-        '1. 理解用户需求，判断是需要你直接回答，还是派给 kimi 实施。',
-        '2. 需要实际动手执行（写代码、改文件、生成文档、跑命令）时，在回复行首 @kimi 派活，并写清楚具体要求。',
-        '3. kimi 交回结果后，你负责检查：达标就总结给用户；不达标就在行首 @kimi 说明要改什么。',
-        '4. 你自己不直接做实施类工作，实施交给 kimi。',
-        '5. 不需要 kimi 时（纯问答、纯分析），直接回复用户，不要写 @。',
-        '6. 检查 kimi 的产出时必须给出明确结论：「通过」/「不通过」/「具体要改什么」。只复述 kimi 说过的话等于没检查。',
-      ].join('\n'),
-      script: 'qwen',
-      enabled: true,
-      handoffExample:
-        '@kimi 请实现 login() 函数，要求支持邮箱和手机号两种登录方式，写完告诉我改了哪些文件。',
-    },
-    kimi: {
-      description: '具体实施。擅长按明确要求写代码、改文件、生成文档、执行操作。',
-      role: 'executor',
-      systemPrompt: [
-        '你是猫咖里的 kimi，负责具体实施。',
-        '你的职责：',
-        '1. 收到 qwen 或用户的具体要求后，动手完成（写代码、改文件、生成文档等）。',
-        '2. 实施完成后，在回复行首 @qwen 交活，简要说明做了什么、改了哪些文件、有什么需要注意的。',
-        '3. 如果需求有歧义、缺信息、或实施中遇到无法自行决策的问题，在行首 @qwen 请示，不要自行猜测。',
-        '4. 如果你是被用户直接 @ 的，实施完成后同样 @qwen 交活，让 qwen 检查。',
-        '5. 不需要 qwen 检查时（例如用户明确说“不用检查，直接给我”），不要写 @。',
-        '6. 交活时必须写清三件事：做了什么、改了哪些文件、有什么需要注意的。只回一句「完成了」会让 qwen 没法检查，也会被打回重做。',
-      ].join('\n'),
-      script: 'kimi',
-      enabled: true,
-      handoffExample:
-        '@qwen login() 已实现，支持邮箱和手机号两种登录方式；改动了 src/auth.js 和 src/auth.test.js，需要注意手机号分支的单测还没补。',
-    },
-  };
+  const seed = {};
+  for (const s of SCRIPTS) {
+    const builtin = BUILTIN_AGENT_PROMPTS[s.id];
+    if (builtin) {
+      seed[s.id] = { ...builtin, script: s.id, enabled: true };
+    } else {
+      seed[s.id] = {
+        description: `${s.description}。默认种子角色，建议在「Agent 管理」面板里补充职责说明。`,
+        role: 'coordinator',
+        systemPrompt: ROLE_TEMPLATES.coordinator, // {{name}} 留给 buildPrompt 注入时替换
+        script: s.id,
+        enabled: true,
+      };
+    }
+  }
+  return seed;
 }
 
 // Agent 管理：systemPrompt 支持的占位符白名单。写错占位符（例如 {{peer}}）
@@ -222,12 +247,18 @@ function validateAgentEntry(raw, seenNames) {
 }
 
 // 种子配置是「name -> 配置」的普通对象，补上 name 走同一套校验，保证与加载结果同构。
-// 种子非法就是代码 bug，直接抛而不是静默跳过。
+// Agent 管理（换 CLI 支持）：种子非法时**跳过并告警**而不是抛异常 ——
+// 抛异常会让整个服务起不来，而「少一个 Agent」远比「起不来」好排查。
+// （历史上这里 throw 过：把 SCRIPTS 换成 claude/gemini 后种子仍引用 qwen/kimi，
+//   启动直接崩，见 2026-11-16 的沙箱复现。）
 function buildAgentMap(seed) {
   const map = {};
   for (const [name, cfg] of Object.entries(seed)) {
     const { agent, error } = validateAgentEntry({ name, ...cfg }, new Set(Object.keys(map)));
-    if (error) throw new Error(`种子配置非法：${error}`);
+    if (error) {
+      console.error(`[agents] 种子配置跳过：${error}`);
+      continue;
+    }
     map[name] = agent;
   }
   return map;
@@ -489,7 +520,7 @@ app.delete('/api/agents/:name', (req, res) => {
 });
 
 // Agent 管理：测试连接。body: { script, systemPrompt }。
-// 用该脚本 spawn 一次「请回复 OK」，10s 超时（坑 3）。
+// 用该脚本 spawn 一次「请回复 OK」。超时见 AGENT_TEST_TIMEOUT_MS 的注释。
 // systemPrompt 的占位符校验在 validateAgentEntry 里做，这里只验「脚本通不通」。
 app.post('/api/agents/test', async (req, res) => {
   const { script } = req.body || {};
@@ -497,8 +528,10 @@ app.post('/api/agents/test', async (req, res) => {
     res.status(400).json({ error: `script 不在预定义列表：${script}` });
     return;
   }
-  const result = await runScriptOnce(script, '请回复 OK', 10_000);
-  console.log(`[agents] 测试连接 script=${script} -> ${result.ok ? '成功' : '失败: ' + result.error}`);
+  const result = await runScriptOnce(script, '请回复 OK', AGENT_TEST_TIMEOUT_MS);
+  console.log(
+    `[agents] 测试连接 script=${script} -> ${result.ok ? '成功' : '失败: ' + result.error}`
+  );
   res.json(result);
 });
 
@@ -1071,37 +1104,70 @@ function parseMentions(text, opts = {}) {
 // 严格模式（lineStartOnly / exclude / limit）只在解析 Agent 输出时生效，
 // 走 HTTP 的 dryRun 覆盖不到它 —— 只能靠真实调用烧 token 才碰得到。
 // 所以在这里补一套确定性断言：node server.js --test-mentions
-const MENTION_CASES = [
-  // ---- 严格模式：解析 Agent 输出 ----
-  ['严格 行首 @ 生效', '@kimi 请实现 foo()', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, ['kimi']],
-  ['严格 缩进行的行首也算', '   @kimi 请实现 foo()', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, ['kimi']],
-  ['严格 句中的 @ 不生效', '我觉得这件事应该让 @kimi 来做', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
-  ['严格 多行中只有行首那行生效', '先说明一下情况\n@kimi 干活\n结尾顺便提到 @qwen', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, ['kimi']],
-  ['严格 排除自己（自己 @ 自己不成链）', '@qwen 我自己继续', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
-  ['严格 自己在行首也不算，取后面的同伴', '@qwen 请继续\n@kimi 也看看', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, ['kimi']],
-  ['严格 limit=1 只取第一个', '@kimi 先做\n@qwen 后做', { lineStartOnly: true, exclude: null, limit: 1 }, ['kimi']],
-  ['严格 围栏代码块内的行首 @ 被剥离', '```bash\n@kimi 装饰器\n```', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
-  ['严格 代码块前的行首 @ 仍生效', '@kimi 看下这段\n```python\n@qwen\n```', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, ['kimi']],
-  ['严格 行内代码里的 @ 被剥离', '`@kimi` 是个装饰器', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
-  ['严格 未闭合围栏也要剥', '```python\n@kimi 装饰器', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
-  ['严格 未注册名字忽略', '@gpt 你好', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
-  ['严格 @ 后跟中文标点仍识别', '@kimi：请实现 foo()', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, ['kimi']],
-  ['严格 大写归一化', '@KIMI 请实现', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, ['kimi']],
-  ['严格 行首的邮箱不误判', 'foo@kimi.com 是联系人', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
-  ['严格 @Override 这类注解不误判', '@Override\npublic void run() {}', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
-  // ---- 宽松模式：解析用户消息 ----
-  ['宽松 句中 @ 生效', '麻烦 @kimi 看一下这个', {}, ['kimi']],
-  ['宽松 可同时召唤多个', '@qwen @kimi 一起看看', {}, ['qwen', 'kimi']],
-  ['宽松 邮箱不误判', '发到 foo@qwen.com 这个邮箱', {}, []],
-  ['宽松 代码块内的 @ 被剥离', '看这段：\n```java\n@kimi\n```', {}, []],
-  ['宽松 未注册名字忽略', '@小明 @gpt 在吗', {}, []],
-  ['宽松 纯文本无 @', '今天天气不错', {}, []],
-];
+// Agent 管理（换 CLI 支持）：用例里的 Agent 名字从当前注册表动态取，不再硬编码 qwen/kimi，
+// 否则换了 SCRIPTS 之后这套自检会全红、反而掩盖真问题。
+// SELF = 第一个注册 Agent（当作「自己」），PEER = 第二个（当作「同伴」）。
+// 只有一个 Agent 时：需要两个名字的用例跳过，其余用例的目标退化为 SELF、exclude 置空，
+// 这样「行首 / 剥代码块 / limit」这些与具体名字无关的规则仍然被测到。
+// 注册表为空时：只跑「未注册名字 / 剥离 / 邮箱」这一族。
+function mentionCases() {
+  const names = Object.keys(AGENTS);
+  const SELF = names[0];
+  const PEER = names[1] || null;
+
+  if (!SELF) {
+    return [
+      ['注册表为空 未注册名字忽略', '@ghost 你好', {}, []],
+      ['注册表为空 严格模式忽略', '@ghost 你好', { lineStartOnly: true, exclude: null, limit: 1 }, []],
+      ['注册表为空 代码块剥离仍生效', '```\n@ghost\n```', {}, []],
+      ['注册表为空 邮箱不误判', 'foo@ghost.com', {}, []],
+    ];
+  }
+
+  const T = PEER || SELF; // 用例里的「同伴」目标
+  const EX = PEER ? SELF : '__none__'; // 严格模式的 exclude；单 Agent 时置一个不存在的名字
+  const two = Boolean(PEER);
+
+  const cases = [
+    // ---- 严格模式：解析 Agent 输出 ----
+    ['严格 行首 @ 生效', `@${T} 请实现 foo()`, { lineStartOnly: true, exclude: EX, limit: 1 }, [T]],
+    ['严格 缩进行的行首也算', `   @${T} 请实现 foo()`, { lineStartOnly: true, exclude: EX, limit: 1 }, [T]],
+    ['严格 句中的 @ 不生效', `我觉得这件事应该让 @${T} 来做`, { lineStartOnly: true, exclude: EX, limit: 1 }, []],
+    ['严格 多行中只有行首那行生效', `先说明一下情况\n@${T} 干活\n结尾顺便提到 @${SELF}`, { lineStartOnly: true, exclude: EX, limit: 1 }, [T]],
+    ['严格 排除自己（自己 @ 自己不成链）', `@${SELF} 我自己继续`, { lineStartOnly: true, exclude: SELF, limit: 1 }, []],
+    ['严格 围栏代码块内的行首 @ 被剥离', '```bash\n@' + T + ' 装饰器\n```', { lineStartOnly: true, exclude: EX, limit: 1 }, []],
+    ['严格 行内代码里的 @ 被剥离', '`@' + T + '` 是个装饰器', { lineStartOnly: true, exclude: EX, limit: 1 }, []],
+    ['严格 未闭合围栏也要剥', '```python\n@' + T + ' 装饰器', { lineStartOnly: true, exclude: EX, limit: 1 }, []],
+    ['严格 未注册名字忽略', '@ghost-404 你好', { lineStartOnly: true, exclude: EX, limit: 1 }, []],
+    ['严格 @ 后跟中文标点仍识别', `@${T}：请实现 foo()`, { lineStartOnly: true, exclude: EX, limit: 1 }, [T]],
+    ['严格 大写归一化', `@${T.toUpperCase()} 请实现`, { lineStartOnly: true, exclude: EX, limit: 1 }, [T]],
+    ['严格 行首的邮箱不误判', `foo@${T}.com 是联系人`, { lineStartOnly: true, exclude: EX, limit: 1 }, []],
+    ['严格 @Override 这类注解不误判', '@Override\npublic void run() {}', { lineStartOnly: true, exclude: EX, limit: 1 }, []],
+    // ---- 宽松模式：解析用户消息 ----
+    ['宽松 句中 @ 生效', `麻烦 @${T} 看一下这个`, {}, [T]],
+    ['宽松 邮箱不误判', `发到 foo@${SELF}.com 这个邮箱`, {}, []],
+    ['宽松 代码块内的 @ 被剥离', '看这段：\n```java\n@' + T + '\n```', {}, []],
+    ['宽松 未注册名字忽略', '@ghost-404 @ghost-405 在吗', {}, []],
+    ['宽松 纯文本无 @', '今天天气不错', {}, []],
+  ];
+
+  if (two) {
+    cases.push(
+      ['严格 自己在行首也不算，取后面的同伴', `@${SELF} 请继续\n@${PEER} 也看看`, { lineStartOnly: true, exclude: SELF, limit: 1 }, [PEER]],
+      ['严格 limit=1 只取第一个', `@${PEER} 先做\n@${SELF} 后做`, { lineStartOnly: true, exclude: null, limit: 1 }, [PEER]],
+      ['严格 代码块前的行首 @ 仍生效', `@${PEER} 看下这段\n\`\`\`python\n@${SELF}\n\`\`\``, { lineStartOnly: true, exclude: SELF, limit: 1 }, [PEER]],
+      ['宽松 可同时召唤多个', `@${SELF} @${PEER} 一起看看`, {}, [SELF, PEER]]
+    );
+  }
+  return cases;
+}
 
 function runMentionTests() {
   let pass = 0;
   let fail = 0;
-  for (const [desc, text, opts, expected] of MENTION_CASES) {
+  const cases = mentionCases();
+  console.log(`  （注册表 ${Object.keys(AGENTS).length} 个 Agent，共 ${cases.length} 条用例）`);
+  for (const [desc, text, opts, expected] of cases) {
     const got = parseMentions(text, opts);
     if (JSON.stringify(got) === JSON.stringify(expected)) {
       pass++;

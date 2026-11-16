@@ -26,19 +26,29 @@ function req(method, path, body) {
   });
 }
 
+// Agent 管理（换 CLI 支持）：script 不硬编码 kimi，运行时取 /api/scripts 的第一个 id，
+// 否则换了 SCRIPTS 之后这套测试会全部 400
 const GOOD = {
   name: 'apitest',
   description: 'API 测试用的临时 Agent',
   role: 'reviewer',
   systemPrompt: '你是 {{name}}，负责测试。{{peers}}',
-  script: 'kimi',
+  script: null,
   enabled: true,
 };
 
 (async () => {
+  const scriptsRes = await req('GET', '/api/scripts');
+  if (!scriptsRes.body || !scriptsRes.body.length) {
+    console.error('❌ /api/scripts 返回为空，无法继续（注册表里一个脚本都没有）');
+    process.exit(1);
+  }
+  GOOD.script = scriptsRes.body[0].id;
+  console.log(`\n使用预定义脚本 id：${GOOD.script}\n`);
+
   console.log('\n=== 1. 元数据接口 ===');
   let r = await req('GET', '/api/scripts');
-  check(r.status === 200 && Array.isArray(r.body) && r.body.length >= 2, `GET /api/scripts -> ${r.status}，${r.body && r.body.length} 个脚本`);
+  check(r.status === 200 && Array.isArray(r.body) && r.body.length >= 1, `GET /api/scripts -> ${r.status}，${r.body && r.body.length} 个脚本`);
   r = await req('GET', '/api/roles');
   check(r.status === 200 && r.body.length === 3 && r.body.every((x) => x.template.includes('{{name}}')),
     'GET /api/roles -> 3 个角色且模板含 {{name}}');
@@ -74,8 +84,8 @@ const GOOD = {
   check(r.status === 404, 'PUT 不存在的 Agent -> 404');
 
   console.log('\n=== 4. 测试连接 ===');
-  r = await req('POST', '/api/agents/test', { script: 'kimi', systemPrompt: 'x' });
-  check(r.status === 200 && r.body.ok === true, `POST /api/agents/test kimi -> ok=${r.body && r.body.ok}，stdout="${r.body && String(r.body.stdout).slice(0, 30)}"`);
+  r = await req('POST', '/api/agents/test', { script: GOOD.script, systemPrompt: 'x' });
+  check(r.status === 200 && r.body.ok === true, `POST /api/agents/test ${GOOD.script} -> ok=${r.body && r.body.ok}，stdout="${r.body && String(r.body.stdout).slice(0, 30)}"`);
   r = await req('POST', '/api/agents/test', { script: 'nope' });
   check(r.status === 400, '测试连接传非法 script -> 400');
 
@@ -90,7 +100,10 @@ const GOOD = {
   console.log('\n=== 6. 收尾状态 ===');
   r = await req('GET', '/api/agents');
   const names = (r.body || []).map((a) => a.name).sort().join(',');
-  check(names === 'kimi,qwen', `最终 Agent 列表回到 qwen,kimi（实为 ${names}）`);
+  // Agent 管理（换 CLI 支持）：最终列表应回到「种子配置」，即 SCRIPTS 的 id 集合，
+  // 而不是硬编码的 qwen,kimi
+  const expected = scriptsRes.body.map((s) => s.id).sort().join(',');
+  check(names === expected, `最终 Agent 列表回到种子配置（${expected}），实为 ${names}`);
   check((r.body || []).every((a) => typeof a.systemPrompt === 'string' && a.systemPrompt.length > 0), 'GET /api/agents 返回 systemPrompt 全文（管理面板需要）');
 
   console.log(`\n=== 结果：${pass} 通过 / ${fail} 失败 ===`);
