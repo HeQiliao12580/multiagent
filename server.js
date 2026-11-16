@@ -69,52 +69,240 @@ const MAX_DEPTH = Number(process.env.MAX_DEPTH) || 4;
 // 也依然碰不到后端源码 —— 实测 headless 的 auto 审批模式下 Agent 会主动对 cwd
 // 调用 glob / grep_search 等工具，cwd 绝不能是项目根目录。
 
-// Agent 注册表：新增一个 Agent 只要在这里加一行，
-// @路由、前端的 Agent 芯片列表都会自动跟上。script 必须是「argv[2] 收提示词、
-// 回复写 stdout、日志写 stderr、成功退出码 0」的脚本。
+// ==================== Agent 管理：注册表 ====================
+// Agent 管理：AGENTS 不再硬编码，启动时从 agents.json 加载（见 loadAgentsConfig）。
+// 下面只保留「种子配置」—— 即改造前硬编码的 qwen/kimi，用于两处兜底：
+//   ① agents.json 不存在时生成初始文件（迁移后行为不变）
+//   ② agents.json 损坏时备份原文件并重建（坑 6）
 //
-// Agent 互 @（阶段 1）：新增三个字段服务于协作能力
-//   description     给「对方」看的职责说明 —— 会被注入同伴 prompt 的「可召唤的同伴」列表
-//   systemPrompt    给「自己」看的角色定义 —— 注入自己 prompt 的最前面
-//   handoffExample  行首 @ 的示范，按角色区分：派活该怎么写 / 交活该怎么写
-const AGENTS = {
-  qwen: {
-    script: 'minimal-qwen.js',
-    label: 'Qwen',
-    description: '任务分发与质量检查。擅长拆解需求、判断任务该由谁做、审查产出是否达标。',
-    systemPrompt: [
-      '你是猫咖里的 qwen，负责任务分发和质量检查。',
-      '你的职责：',
-      '1. 理解用户需求，判断是需要你直接回答，还是派给 kimi 实施。',
-      '2. 需要实际动手执行（写代码、改文件、生成文档、跑命令）时，在回复行首 @kimi 派活，并写清楚具体要求。',
-      '3. kimi 交回结果后，你负责检查：达标就总结给用户；不达标就在行首 @kimi 说明要改什么。',
-      '4. 你自己不直接做实施类工作，实施交给 kimi。',
-      '5. 不需要 kimi 时（纯问答、纯分析），直接回复用户，不要写 @。',
-      // 坑 4：qwen 只复述 kimi 的话没有增量价值，必须给明确结论
-      '6. 检查 kimi 的产出时必须给出明确结论：「通过」/「不通过」/「具体要改什么」。只复述 kimi 说过的话等于没检查。',
-    ].join('\n'),
-    handoffExample:
-      '@kimi 请实现 login() 函数，要求支持邮箱和手机号两种登录方式，写完告诉我改了哪些文件。',
-  },
-  kimi: {
-    script: 'minimal-kimi.js',
-    label: 'Kimi',
-    description: '具体实施。擅长按明确要求写代码、改文件、生成文档、执行操作。',
-    systemPrompt: [
-      '你是猫咖里的 kimi，负责具体实施。',
-      '你的职责：',
-      '1. 收到 qwen 或用户的具体要求后，动手完成（写代码、改文件、生成文档等）。',
-      '2. 实施完成后，在回复行首 @qwen 交活，简要说明做了什么、改了哪些文件、有什么需要注意的。',
-      '3. 如果需求有歧义、缺信息、或实施中遇到无法自行决策的问题，在行首 @qwen 请示，不要自行猜测。',
-      '4. 如果你是被用户直接 @ 的，实施完成后同样 @qwen 交活，让 qwen 检查。',
-      '5. 不需要 qwen 检查时（例如用户明确说“不用检查，直接给我”），不要写 @。',
-      // 坑 3：kimi 只说「完成了」会让 qwen 无法检查，必须交代改动内容
-      '6. 交活时必须写清三件事：做了什么、改了哪些文件、有什么需要注意的。只回一句「完成了」会让 qwen 没法检查，也会被打回重做。',
-    ].join('\n'),
-    handoffExample:
-      '@qwen login() 已实现，支持邮箱和手机号两种登录方式；改动了 src/auth.js 和 src/auth.test.js，需要注意手机号分支的单测还没补。',
-  },
+// 字段说明：
+//   name(键)         小写字母/数字/连字符，全局唯一；@mention、历史归属都用它
+//   label            界面显示名，加载时由 name 派生（首字母大写），不落盘
+//   description      给「对方」看的职责说明，注入同伴 prompt 的「可召唤的同伴」列表
+//   role             executor / reviewer / coordinator；决定新建时的模板与通用示例写法
+//   systemPrompt     给「自己」看的角色定义；支持 {{name}} / {{peers}} / {{roomContext}} 占位符
+//   script           预定义脚本 id（见 SCRIPTS），不允许填任意路径
+//   enabled          禁用后立即从 @ 清单与路由里消失
+//   handoffExample   可选。行首 @ 的示范；缺省时按 role 生成通用示例
+const SCRIPTS = [
+  { id: 'qwen', path: './minimal-qwen.js', description: 'Qwen CLI 调用脚本' },
+  { id: 'kimi', path: './minimal-kimi.js', description: 'Kimi CLI 调用脚本' },
+];
+const AGENT_ROLES = ['executor', 'reviewer', 'coordinator'];
+const AGENT_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/;
+const AGENTS_FILE = path.join(__dirname, 'agents.json');
+
+// Agent 管理：新建 Agent 选角色后自动填入的模板。{{name}} 在注入时替换。
+// 同伴清单与召唤规则**不写死在模板里**，由 buildPrompt 统一追加，
+// 否则每个模板各写一份，改规则时要改 N 处、必然漂移。
+const ROLE_TEMPLATES = {
+  executor: [
+    '你是 {{name}}，负责具体实施。',
+    '职责：',
+    '1. 按明确要求动手完成（写代码、改文件、生成文档等）。',
+    '2. 完成后说明做了什么、改了哪些文件、有什么需要注意的。',
+    '3. 如果需要派活给你的人检查，在行首 @对方；不需要时直接回复。',
+    '4. 不做超出要求范围的额外改动。',
+  ].join('\n'),
+  reviewer: [
+    '你是 {{name}}，负责质量检查。',
+    '职责：',
+    '1. 检查产出是否满足要求，给出明确结论：通过 / 不通过 / 要改什么。',
+    '2. 不直接动手修改，只给出反馈。',
+    '3. 需要原实施者修改时，在行首 @对方并说明要改什么。',
+    '4. 如果通过，直接给出结论，不要写 @。',
+  ].join('\n'),
+  coordinator: [
+    '你是 {{name}}，负责任务分发和汇总。',
+    '职责：',
+    '1. 理解用户需求，判断该由谁实施。',
+    '2. 需要实施时，在行首 @合适的同伴，写清楚具体要求。',
+    '3. 收到实施结果后，决定是继续派活还是汇总给用户。',
+    '4. 不需要派活时，直接回复用户。',
+  ].join('\n'),
 };
+
+// Agent 管理：内存注册表，由 loadAgentsConfig() 填充
+let AGENTS = {};
+
+function agentLabel(name) {
+  return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
+// Agent 管理：种子配置。role 按实际职责标 —— qwen 分发+质检 = coordinator，kimi 实施 = executor。
+// systemPrompt 沿用改造前调好的版本（不是通用模板），保证迁移后行为不变。
+function defaultAgents() {
+  return {
+    qwen: {
+      description: '任务分发与质量检查。擅长拆解需求、判断任务该由谁做、审查产出是否达标。',
+      role: 'coordinator',
+      systemPrompt: [
+        '你是猫咖里的 qwen，负责任务分发和质量检查。',
+        '你的职责：',
+        '1. 理解用户需求，判断是需要你直接回答，还是派给 kimi 实施。',
+        '2. 需要实际动手执行（写代码、改文件、生成文档、跑命令）时，在回复行首 @kimi 派活，并写清楚具体要求。',
+        '3. kimi 交回结果后，你负责检查：达标就总结给用户；不达标就在行首 @kimi 说明要改什么。',
+        '4. 你自己不直接做实施类工作，实施交给 kimi。',
+        '5. 不需要 kimi 时（纯问答、纯分析），直接回复用户，不要写 @。',
+        '6. 检查 kimi 的产出时必须给出明确结论：「通过」/「不通过」/「具体要改什么」。只复述 kimi 说过的话等于没检查。',
+      ].join('\n'),
+      script: 'qwen',
+      enabled: true,
+      handoffExample:
+        '@kimi 请实现 login() 函数，要求支持邮箱和手机号两种登录方式，写完告诉我改了哪些文件。',
+    },
+    kimi: {
+      description: '具体实施。擅长按明确要求写代码、改文件、生成文档、执行操作。',
+      role: 'executor',
+      systemPrompt: [
+        '你是猫咖里的 kimi，负责具体实施。',
+        '你的职责：',
+        '1. 收到 qwen 或用户的具体要求后，动手完成（写代码、改文件、生成文档等）。',
+        '2. 实施完成后，在回复行首 @qwen 交活，简要说明做了什么、改了哪些文件、有什么需要注意的。',
+        '3. 如果需求有歧义、缺信息、或实施中遇到无法自行决策的问题，在行首 @qwen 请示，不要自行猜测。',
+        '4. 如果你是被用户直接 @ 的，实施完成后同样 @qwen 交活，让 qwen 检查。',
+        '5. 不需要 qwen 检查时（例如用户明确说“不用检查，直接给我”），不要写 @。',
+        '6. 交活时必须写清三件事：做了什么、改了哪些文件、有什么需要注意的。只回一句「完成了」会让 qwen 没法检查，也会被打回重做。',
+      ].join('\n'),
+      script: 'kimi',
+      enabled: true,
+      handoffExample:
+        '@qwen login() 已实现，支持邮箱和手机号两种登录方式；改动了 src/auth.js 和 src/auth.test.js，需要注意手机号分支的单测还没补。',
+    },
+  };
+}
+
+// Agent 管理：校验单条配置，返回 { agent } 或 { error }。
+// 规则照需求：name 合法且唯一、script 在预定义列表、role 合法、enabled 为布尔。
+function validateAgentEntry(raw, seenNames) {
+  if (!raw || typeof raw !== 'object') return { error: '配置不是对象' };
+  const name = String(raw.name || '').trim();
+  if (!AGENT_NAME_RE.test(name)) return { error: `name 非法：「${name || '(空)'}」` };
+  if (seenNames.has(name)) return { error: `name 重复：${name}` };
+  if (!SCRIPTS.some((s) => s.id === raw.script)) {
+    return { error: `${name} 的 script 不在预定义列表：${raw.script}` };
+  }
+  if (!AGENT_ROLES.includes(raw.role)) return { error: `${name} 的 role 非法：${raw.role}` };
+  if (typeof raw.enabled !== 'boolean') return { error: `${name} 的 enabled 不是布尔值` };
+  if (typeof raw.description !== 'string' || !raw.description.trim()) {
+    return { error: `${name} 缺少 description` };
+  }
+  if (typeof raw.systemPrompt !== 'string' || !raw.systemPrompt.trim()) {
+    return { error: `${name} 缺少 systemPrompt` };
+  }
+
+  seenNames.add(name);
+  return {
+    agent: {
+      description: raw.description.trim(),
+      role: raw.role,
+      systemPrompt: raw.systemPrompt,
+      script: raw.script,
+      enabled: raw.enabled,
+      createdAt: Number(raw.createdAt) || Date.now(),
+      handoffExample: typeof raw.handoffExample === 'string' ? raw.handoffExample : null,
+      label: agentLabel(name), // 派生字段，不落盘
+    },
+  };
+}
+
+// 种子配置是「name -> 配置」的普通对象，补上 name 走同一套校验，保证与加载结果同构。
+// 种子非法就是代码 bug，直接抛而不是静默跳过。
+function buildAgentMap(seed) {
+  const map = {};
+  for (const [name, cfg] of Object.entries(seed)) {
+    const { agent, error } = validateAgentEntry({ name, ...cfg }, new Set(Object.keys(map)));
+    if (error) throw new Error(`种子配置非法：${error}`);
+    map[name] = agent;
+  }
+  return map;
+}
+
+// Agent 管理：写 agents.json。临时文件 + rename，防并发/崩溃写出半个 JSON（同 rooms.json）。
+function saveAgents() {
+  const list = Object.entries(AGENTS).map(([name, a]) => ({
+    name,
+    description: a.description,
+    role: a.role,
+    systemPrompt: a.systemPrompt,
+    script: a.script,
+    enabled: a.enabled,
+    createdAt: a.createdAt,
+    ...(a.handoffExample ? { handoffExample: a.handoffExample } : {}),
+  }));
+  const tmp = AGENTS_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify({ agents: list }, null, 2) + '\n');
+  fs.renameSync(tmp, AGENTS_FILE);
+}
+
+// Agent 管理：启动时加载注册表，三种兜底：
+//   文件不存在     -> 用种子配置生成初始文件
+//   JSON 损坏      -> 原文件改名 .corrupt-<ts> 备份，再用种子配置重建（坑 6）
+//   单条记录非法   -> 记日志跳过该条，不影响其他 Agent
+function loadAgentsConfig() {
+  let raw = null;
+  try {
+    raw = fs.readFileSync(AGENTS_FILE, 'utf8');
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.error('[agents] 读取 agents.json 失败:', err.message);
+  }
+
+  if (raw === null) {
+    AGENTS = buildAgentMap(defaultAgents());
+    saveAgents();
+    console.log(`[agents] 未找到 agents.json，已生成初始配置：${Object.keys(AGENTS).join(', ')}`);
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const bak = AGENTS_FILE + '.corrupt-' + Date.now();
+    try {
+      fs.renameSync(AGENTS_FILE, bak);
+    } catch {
+      /* 备份失败也继续重建，不能因此起不来 */
+    }
+    console.error(
+      `[agents] agents.json 损坏（${err.message}），已备份为 ${path.basename(bak)}，用默认配置重建`
+    );
+    AGENTS = buildAgentMap(defaultAgents());
+    saveAgents();
+    return;
+  }
+
+  const entries = Array.isArray(parsed) ? parsed : Array.isArray(parsed.agents) ? parsed.agents : [];
+  const built = {};
+  const seen = new Set();
+  for (const entry of entries) {
+    const { agent, error } = validateAgentEntry(entry, seen);
+    if (error) {
+      console.error(`[agents] 跳过非法配置：${error}`);
+      continue;
+    }
+    built[String(entry.name).trim()] = agent;
+  }
+
+  if (Object.keys(built).length === 0) {
+    // 一条合法都没有：文件被清空或格式整体不对。与其让系统一个 Agent 都没有，
+    // 不如回落种子配置并大声告警 —— 「故意不要任何 Agent」应该用 enabled:false 表达。
+    console.error('[agents] agents.json 里没有任何合法 Agent，回落到默认配置');
+    AGENTS = buildAgentMap(defaultAgents());
+    saveAgents();
+    return;
+  }
+
+  AGENTS = built;
+  console.log(`[agents] 载入 ${Object.keys(AGENTS).length} 个 Agent：${Object.keys(AGENTS).join(', ')}`);
+}
+
+// Agent 管理：script id -> 绝对路径。只认 SCRIPTS 里登记过的脚本，
+// 所以即使 agents.json 被改也 spawn 不了任意文件（需求的硬约束）。
+function scriptPathFor(agent) {
+  const s = SCRIPTS.find((x) => x.id === agent.script);
+  return path.join(__dirname, s.path);
+}
 
 const app = express();
 app.use(express.json());
@@ -685,6 +873,9 @@ function parseMentions(text, opts = {}) {
   for (const match of source.matchAll(re)) {
     const name = match[1].toLowerCase();
     if (!AGENTS[name]) continue; // 未注册的名字直接忽略
+    // Agent 管理：禁用的 Agent 立即从路由里消失 —— 否则 @ 一个已禁用的 Agent
+    // 会真的 spawn 它，和「禁用」的语义矛盾
+    if (!AGENTS[name].enabled) continue;
     if (name === exclude) continue; // 不 @ 自己
     if (found.includes(name)) continue;
     found.push(name);
@@ -1020,7 +1211,9 @@ function runAgent(room, name, prompt) {
   const agent = AGENTS[name];
 
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [path.join(__dirname, agent.script), prompt], {
+    // Agent 管理：script 字段存的是预定义列表里的 id，这里解析成绝对路径。
+    // 不再硬编码 minimal-qwen.js / minimal-kimi.js。
+    const child = spawn(process.execPath, [scriptPathFor(agent), prompt], {
       // 每个房间独立的工作目录：Agent 只看得到本房间的文件，
       // 既隔离了房间之间的产物，也依然碰不到后端源码。
       cwd: room.workspace,
@@ -1153,6 +1346,9 @@ server.on('error', (err) => {
 //   node server.js                                   正常启动常驻服务
 // 自检刻意排在 bootstrap 之前：它不需要房间数据，
 // 也能避免 loadRooms 的「载入 N 条历史」日志混进测试结果里。
+// Agent 管理：注册表要先加载 —— --test-mentions 和 --print-prompt 都依赖 AGENTS。
+loadAgentsConfig();
+
 if (process.argv.includes('--test-mentions')) {
   process.exitCode = runMentionTests() ? 0 : 1;
 } else {

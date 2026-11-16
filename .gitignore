@@ -8,6 +8,11 @@ workspaces/*
 # 房间注册表：运行时生成，启动时会自建默认房间并按 workspaces/ 目录扫描恢复
 rooms.json
 
+# Agent 注册表：运行时生成，启动时不存在就用默认 qwen/kimi 重建；
+# 损坏时自动备份为 agents.json.corrupt-<ts>（备份同样不入库）
+agents.json
+agents.json.corrupt-*
+
 # 共享记忆落盘：聊天记录可能含敏感内容，绝不提交
 data/
 
