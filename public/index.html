@@ -418,6 +418,8 @@
   // Agent 互 @（阶段 4）
   var chainState = {};   // agentName -> depth，只统计 depth>0 的在跑调用
   var lastHandoff = null; // { from, to }，用来把「kimi 交回给 qwen」这类关系说清楚
+  // 侧边栏：新建房间的请求是否在飞，防连点建出重复房间
+  var creating = false;
 
   // 侧边栏：记住上次所在的房间。优先级 URL ?room= > localStorage > room-default
   var STORAGE_KEY = 'multiagent.currentRoom';
@@ -846,6 +848,8 @@
   }
 
   function createRoom() {
+    // 侧边栏：防连点。POST 是异步的，连点两次会建出两个同名后缀的重复房间
+    if (creating) return;
     var name = window.prompt('新房间的名称（显示用，可以是中文）：');
     if (name === null) return;
     name = name.trim();
@@ -866,13 +870,21 @@
       payload.id = clean;
     }
 
+    creating = true;
+    newRoomBtn.disabled = true;   // 侧边栏：请求在飞时按钮置灰，视觉上也挡住连点
     api('POST', '/api/rooms', payload).then(function (res) {
+      creating = false;
+      newRoomBtn.disabled = false;
       if (!res.ok) {
         addNote('新建房间失败（HTTP ' + res.status + '）：' + (res.body.error || '未知错误'));
         return;
       }
       return refreshRooms().then(function () { switchRoom(res.body.id, true); });
-    }).catch(function (e) { addNote('新建房间失败：' + e.message); });
+    }).catch(function (e) {
+      creating = false;
+      newRoomBtn.disabled = false;
+      addNote('新建房间失败：' + e.message);
+    });
   }
 
   function deleteRoom() {
