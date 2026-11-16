@@ -290,6 +290,47 @@ curl -s -X POST localhost:3000/api/rooms/room-default/messages \
 所以没有再单独实现"同对 Agent 来回最多 N 次"的计数器 —— 加了也是冗余。
 若将来 Agent 数 ≥ 3，链可能分叉，那时才需要按「Agent 对」计数。
 
+### 怎么验证
+
+**零成本**（不调用 Agent、不花 token）：
+
+```bash
+node server.js --test-mentions             # @ 解析自检，22 条断言，失败退出码 1
+node server.js --print-prompt qwen         # 看拼给 qwen 的完整 prompt
+node server.js --print-prompt kimi proj-a  # 指定房间
+```
+
+`--print-prompt` 是确认「Agent 到底看到了什么」最直接的办法：角色定义、可召唤的同伴、
+行首 @ 规则、注入的房间历史，全都在里面。
+
+**真实调用**（会烧 token）：
+
+```bash
+# 观察一条协作链：逐轮打印 depth / triggeredBy / mentions / depthLimited
+node scripts/chain-watch.js room-default \
+  "@qwen 请在当前目录创建 hello.py，打印 hello world，并实际运行一次"
+
+# 验证「停止协作」安全阀：A 段中途终止 + B 段验证能恢复
+node scripts/stop-chain-test.js
+```
+
+- `chain-watch.js` 默认在最后一个事件后**静默 90s** 才判定链条结束（qwen 带工具核验时
+  单轮可到 80s，窗口再短会误判）。只想快速验证单轮调用：`CHAIN_IDLE_MS=15000 node scripts/chain-watch.js …`
+- `stop-chain-test.js` 不带 roomId 时会自建一次性房间、跑完自动删除；
+  指定已有房间则会往里写测试消息和 `stop-a.txt` / `stop-b.txt`
+
+**浏览器**（验证前端协作可视化，改完前端记得硬刷新 Cmd+Shift+R）：
+
+发一条实施类任务，例如 `@qwen 请在当前目录创建 hello.py，打印 hello world，并实际运行一次`，
+应该依次看到：
+
+1. 顶部蓝色横幅 `协作中… 第 1 轮（Kimi 正在处理）` + 右侧「停止协作」按钮
+2. Agent 气泡下方 `⇄ Qwen 召唤了 Kimi`、`⇄ Kimi 召唤了 Qwen（协作第 2 轮）` 标注
+3. kimi 写出的文件出现在 `workspaces/<roomId>/`
+4. qwen 质检给出「通过 / 不通过」明确结论后，链条自然结束、横幅消失
+5. 中途点「停止协作」→ 横幅消失，出现"协作已终止（中断了 N 个正在跑的调用）"；
+   再发一条新消息，协作应能正常重新触发
+
 ### 消息事件新增字段
 
 `agent_message` 事件除原有字段外新增：
