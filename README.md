@@ -145,14 +145,19 @@ ws://localhost:3000/ws?room=<roomId>
 
 ```jsonc
 { "type": "history", "roomId": "proj-a", "messages": [ /* 消息数组，消息体本身不带 roomId */ ] }
-{ "type": "message", "roomId": "proj-a", "from": "user",  "sender": "me", "text": "...", "ts": 0 }
-{ "type": "message", "roomId": "proj-a", "from": "agent", "agent": "qwen", "label": "Qwen",
-  "text": "...", "ctx": 4, "ms": 5800, "degraded": null, "ts": 0 }
-{ "type": "status",  "roomId": "proj-a", "agent": "qwen", "state": "thinking" }
+{ "type": "user_message",  "roomId": "proj-a", "from": "user",  "sender": "me", "text": "...", "ts": 0 }
+{ "type": "agent_message", "roomId": "proj-a", "from": "agent", "agent": "qwen", "label": "Qwen",
+  "text": "...", "ctx": 4, "ms": 5800, "degraded": null,
+  "mentions": ["kimi"], "triggeredBy": "user_mention", "depth": 0, "depthLimited": false, "ts": 0 }
+{ "type": "status",  "roomId": "proj-a", "agent": "qwen", "state": "thinking", "depth": 0 }
+{ "type": "chain_stopped", "roomId": "proj-a", "killed": 1 }
 ```
 
 `status.state` 取值：`thinking`（开始跑）/ `idle`（结束）/ `busy`（该 Agent 已有调用在跑，本次跳过）
-/ `error`（失败，附 `error` 字段）。
+/ `error`（失败，附 `error` 字段）/ `aborted`（被用户「停止协作」终止，属主动行为不是故障）。
+`status` 事件同样带 `depth` 与 `triggeredBy`，链条因并发闸中断时前端才讲得清原因。
+
+`chain_stopped` 是对 `stop_chain` 控制消息的确认，`killed` 是当时被杀掉的子进程数。
 
 `degraded` 非空表示 Agent 没能正常收尾，但已收到的输出仍被返回（见下文「已知坑」）。
 `ctx` 是本次注入了多少条历史。
@@ -161,6 +166,7 @@ ws://localhost:3000/ws?room=<roomId>
 
 ```jsonc
 { "type": "chat", "text": "@qwen 你好", "sender": "me" }
+{ "type": "stop_chain" }   // 终止本房间的协作链；roomId 取自握手连接，无法跨房间终止
 ```
 
 ---
@@ -178,6 +184,19 @@ ws://localhost:3000/ws?room=<roomId>
   要你补一个英文 ID**（CJK 被剥掉后 slug 就空了，后端只能退化成 `room-N`）。建好自动切进去
 - **删除**：仅对非默认房间可用。二次确认会写明将删除该房间的历史和 `workspaces/<id>/`
   下所有文件。删完自动回到 `room-default`
+
+### 协作可视化
+
+- **协作横幅**：只要有 `depth > 0` 的调用在跑，页面顶部出现蓝色横幅
+  `协作中… 第 N 轮（Kimi 正在处理）`，右侧是 **停止协作** 按钮
+- **停止协作**：发 `{type:'stop_chain'}` 控制消息，后端做两件事 ——
+  ① 打上 aborted 标记，拦住已经排上的下一跳；② SIGKILL 本房间正在跑的子进程组。
+  只影响当前房间，别的房间协作链不受影响。**下一条用户消息会自动清除该标记**，
+  房间随即恢复正常协作（否则按一次就永久瘫了）
+- **召唤关系标注**：Agent 消息气泡下方显示 `⇄ Qwen 召唤了 Kimi`、
+  `⇄ Kimi 召唤了 Qwen（协作第 2 轮）`，一眼区分"用户问的"和"Agent 之间互相召唤的"
+- **轮数上限**：被 `MAX_DEPTH` 截断时显示"⚠ 协作轮数已达上限，链条在此截断"
+- 切换房间时横幅、思考中指示、芯片高亮一起清掉，不会把上个房间的状态带过来
 
 ### 连接与容错
 
@@ -410,5 +429,6 @@ LLM 分类器会自动放行它认为安全的操作。实测一句"一起看看
 - ✅ 阶段 3：循环控制验证 —— 新增 `--test-mentions` 自检（22 条断言，覆盖严格模式）；
       对抗性测试（明确要求"来回至少 8 轮"）在 `MAX_DEPTH` 处被截断，3 次调用即停；
       过程中发现并修掉 `AGENT_IDLE_MS=15s` 误杀正在思考的 qwen，默认值提到 60s
-- ⬜ 阶段 4：前端协作可视化 —— 高亮 Agent 之间的 @、标注召唤关系、
-      "协作中…"指示、"停止协作"按钮（目前只有最小标记：`· 协作第 N 轮` 和上限提示）
+- ✅ 阶段 4：前端协作可视化 —— 协作横幅（`协作中… 第 N 轮`）、召唤关系标注
+      （`⇄ Qwen 召唤了 Kimi`）、轮数上限提示、**停止协作**按钮
+      （`stop_chain` 控制消息 + 后端 `chain_stopped` 确认 + `aborted` 状态）

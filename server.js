@@ -591,6 +591,12 @@ wss.on('connection', (ws, _req, roomId) => {
         data.text.trim(),
         typeof data.sender === 'string' ? data.sender : 'user'
       );
+      return;
+    }
+    // Agent 互 @（阶段 4）：控制消息 —— 前端「停止协作」按钮发来的。
+    // roomId 取自握手时校验过的值，客户端无法终止别的房间的链条。
+    if (data.type === 'stop_chain') {
+      stopChain(roomId);
     }
   });
 
@@ -612,6 +618,10 @@ function handleIncoming(roomId, text, sender) {
     console.error(`[router] 房间 ${roomId} 不存在，丢弃这条消息`);
     return;
   }
+
+  // Agent 互 @（阶段 4）：用户发新消息视为重新开始，清掉上一次的「停止协作」标记，
+  // 否则这个房间会永久无法再触发协作链。
+  abortedRooms.delete(roomId);
 
   // Agent 互 @（阶段 2）：消息类型从笼统的 message 拆成 user_message / agent_message，
   // 前后端都据此区分「谁说的」。旧历史里存的还是 message，读取端三种都认。
@@ -747,6 +757,14 @@ const running = new Set();
 // Agent 脚下被抽掉，结果也会因房间已不存在而被丢弃。
 const inFlightByRoom = new Map();
 
+// Agent 互 @（阶段 4）：「停止协作」需要的两份状态。
+// roomChildren: roomId -> Set<ChildProcess>，为了能精准杀掉「这个房间」正在跑的子进程，
+//               而不影响其他房间的调用（activeChildren 是全局的，粒度不够）。
+// abortedRooms: 已请求终止的房间集合。链条推进前会查它，从而拦下已经排上的下一跳。
+//               标记在下一条用户消息到达时清除，否则这个房间会永久无法协作。
+const roomChildren = new Map();
+const abortedRooms = new Set();
+
 // Agent 互 @（阶段 2）：新增 depth / triggeredBy 两个参数。
 //   depth        本次调用在协作链里的深度：用户直接 @ 的是 0，每传递一次 +1
 //   triggeredBy  'user_mention'（用户 @）| 'agent_mention'（同伴 @）
@@ -846,12 +864,16 @@ async function dispatchToAgent(roomId, name, depth = 0, triggeredBy = 'user_ment
   } catch (err) {
     // Agent 失败只广播错误、不抛出：后端必须继续服务其他消息。
     // 失败时 nextTargets 保持为空，链条自然终止 —— 不能拿半截输出去触发下一轮。
-    console.error(`[agent:${roomId}/${name}] ${err.message}`);
+    // Agent 互 @（阶段 4）：被「停止协作」杀掉的调用也会走到这里，单独报 aborted 而不是
+    // error —— 那是用户主动行为、不是故障，前端要区别对待（不该显示成红色报错）。
+    const aborted = abortedRooms.has(roomId);
+    if (aborted) console.log(`[chain:${roomId}] ${name} 的调用已被用户终止`);
+    else console.error(`[agent:${roomId}/${name}] ${err.message}`);
     publish(roomId, {
       type: 'status',
       agent: name,
-      state: 'error',
-      error: err.message,
+      state: aborted ? 'aborted' : 'error',
+      error: aborted ? '协作已被用户终止' : err.message,
       depth,
       triggeredBy,
       ts: Date.now(),
@@ -875,11 +897,44 @@ async function dispatchToAgent(roomId, name, depth = 0, triggeredBy = 'user_ment
   // 此时 running 已释放，不会占着自己的锁去等下一个 Agent；
   // idle 状态也已经发出去了，即使下一轮出问题前端也不会卡在「思考中」。
   for (const target of nextTargets) {
+    // Agent 互 @（阶段 4）：用户可能在这一轮跑的过程中按了「停止协作」
+    if (abortedRooms.has(roomId)) {
+      console.log(`[chain:${roomId}] 已被用户终止，不再派发 ${name} -> ${target}`);
+      break;
+    }
     console.log(`[chain:${roomId}] ${name} @${target}，depth ${depth} -> ${depth + 1}`);
     dispatchToAgent(roomId, target, depth + 1, 'agent_mention').catch((err) => {
       console.error(`[chain:${roomId}/${target}] 未预期的异常:`, err);
     });
   }
+}
+
+// Agent 互 @（阶段 4）：终止某个房间的活跃协作链。做两件事：
+//   ① 打上 aborted 标记 —— 拦住已经排上的下一跳（光杀进程不够，
+//      因为当前这轮的 finally 之后还会尝试派发下一个 Agent）
+//   ② SIGKILL 本房间正在跑的子进程组 —— 让用户立刻看到效果，不用等这一轮自然结束
+// 只动本房间：其他房间的协作链不受影响。
+function stopChain(roomId) {
+  if (!getRoom(roomId)) return false;
+
+  abortedRooms.add(roomId);
+
+  let killed = 0;
+  const children = roomChildren.get(roomId);
+  if (children) {
+    for (const child of children) {
+      try {
+        process.kill(-child.pid, 'SIGKILL'); // 负 pid = 整个进程组，含内层 CLI
+        killed++;
+      } catch {
+        /* 已经自己退了 */
+      }
+    }
+  }
+
+  console.log(`[chain:${roomId}] 用户请求终止协作，杀掉 ${killed} 个在跑的子进程`);
+  publish(roomId, { type: 'chain_stopped', killed, ts: Date.now() });
+  return true;
 }
 
 // 组装发给 Agent 的完整 prompt：角色定义 + 同伴与召唤规则 + 共享对话转录 + 输出约束。
@@ -975,6 +1030,9 @@ function runAgent(room, name, prompt) {
     });
 
     activeChildren.add(child);
+    // Agent 互 @（阶段 4）：再按房间登记一份，「停止协作」才能只杀本房间的子进程
+    if (!roomChildren.has(room.id)) roomChildren.set(room.id, new Set());
+    roomChildren.get(room.id).add(child);
 
     let stdout = '';
     let stderr = '';
@@ -996,6 +1054,11 @@ function runAgent(room, name, prompt) {
       clearTimeout(hardTimer);
       clearTimeout(idleTimer);
       activeChildren.delete(child);
+      const siblings = roomChildren.get(room.id);
+      if (siblings) {
+        siblings.delete(child);
+        if (siblings.size === 0) roomChildren.delete(room.id);
+      }
       fn(arg);
     };
 
