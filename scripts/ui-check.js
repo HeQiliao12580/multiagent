@@ -2,11 +2,12 @@
 // 无头 Chrome 的前端确定性检查工具（走 CDP，不依赖 puppeteer/playwright）。
 //
 // 用法：
-//   node scripts/ui-check.js <url> <就绪条件JS表达式> [截图输出路径]
+//   node scripts/ui-check.js <url> <就绪条件JS表达式> [截图输出路径] [超时ms] [交互JS] [交互后等待条件]
 // 例：
 //   node scripts/ui-check.js "http://localhost:3000/?room=room-default" \
-//     "document.querySelectorAll('.room-item').length>0 && document.querySelectorAll('.bubble').length>0" \
-//     /tmp/ui.png
+//     "document.querySelectorAll('.room-item').length>0" /tmp/ui.png 45000 \
+//     "document.querySelector('.room-item[data-room=\"proj-a\"]').click()" \
+//     "document.title.indexOf('proj-a')===0"
 //
 // 为什么需要它：Chrome 的 --screenshot + --virtual-time-budget 在 WebSocket 场景下不可靠
 // （虚拟时间不等待真实网络握手，截图经常拍在「连接中…」的空白态）。
@@ -144,6 +145,35 @@ function getJson(path) {
     await die(1);
   }
   console.log('✅ 就绪条件满足: ' + readyExpr);
+
+  // 可选：就绪后执行一段交互（例如点击某个房间条目），再等第二个条件。
+  // 这样才能验证「点击 → 切换」这类行为，而不是只看首屏。
+  // argv: 2=url 3=就绪条件 4=截图 5=超时 6=交互 7=交互后等待条件
+  const actionJs = process.argv[6];
+  const waitExpr = process.argv[7];
+  if (actionJs) {
+    await evalJs(actionJs);
+    console.log('✅ 已执行交互: ' + actionJs.slice(0, 100));
+    if (waitExpr) {
+      const dl2 = Date.now() + timeoutMs;
+      let ok2 = false;
+      while (Date.now() < dl2) {
+        try { ok2 = await evalJs(`!!(${waitExpr})`); if (ok2) break; } catch { /* 页面还在切 */ }
+        await sleep(400);
+      }
+      if (!ok2) {
+        console.log('❌ 交互后的等待条件超时: ' + waitExpr);
+        const st = await evalJs(`JSON.stringify({
+          title: document.title, search: location.search,
+          active: (document.querySelector('.room-item.active')||{}).dataset,
+          bubbles: document.querySelectorAll('.bubble').length,
+          conn: (document.getElementById('connText')||{}).textContent })`).catch(() => null);
+        if (st) console.log('   当时页面状态: ' + st);
+        await die(1);
+      }
+      console.log('✅ 交互后条件满足: ' + waitExpr.slice(0, 100));
+    }
+  }
 
   // 等一帧绘制稳定再截图
   await sleep(500);

@@ -193,19 +193,6 @@
     color: var(--muted);
     margin-left: 6px;
   }
-  /* 多房间改造（阶段 4）：房间切换器 */
-  .rooms { display: flex; align-items: center; gap: 6px; }
-  #roomSelect {
-    font: inherit;
-    font-size: 13px;
-    padding: 3px 8px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: #fff;
-    color: var(--text);
-    max-width: 220px;
-  }
-  #roomSelect:focus { outline: 2px solid rgba(47, 111, 235, .35); }
   .mini {
     font: inherit;
     font-size: 12px;
@@ -372,15 +359,10 @@
   <!-- 右侧：聊天主区域 -->
   <main class="main">
     <header class="main-head">
-      <!-- 侧边栏：当前房间名。阶段 1 先占位，阶段 3 起由 JS 跟随切换更新 -->
-      <h1 class="room-title" id="roomTitle">Multi-Agent 聊天室</h1>
-
-      <!-- 阶段 3 会移除这个下拉框（改由左侧列表切换）；阶段 1 先保留，保证切换功能不断档 -->
-      <div class="rooms">
-        <select id="roomSelect" title="切换房间"></select>
-        <button id="delRoomBtn" type="button" class="mini danger" title="删除当前房间（默认房间不可删）">删除</button>
-      </div>
-
+      <!-- 侧边栏：当前房间名 + 房间 id，跟随切换更新 -->
+      <h1 class="room-title"><span id="roomTitle">—</span><span class="rid" id="roomIdTag"></span></h1>
+      <!-- 侧边栏：删除按钮从原下拉框旁边挪到房间名后面，功能不变 -->
+      <button id="delRoomBtn" type="button" class="mini danger" title="删除当前房间（默认房间不可删）">删除</button>
       <div id="agents" class="agents"></div>
       <div class="conn"><span id="dot" class="dot"></span><span id="connText">连接中…</span></div>
     </header>
@@ -413,10 +395,11 @@
   var agentsBox = document.getElementById('agents');
   var dot = document.getElementById('dot');
   var connText = document.getElementById('connText');
-  // 多房间改造（阶段 4）：房间切换器
-  var roomSelect = document.getElementById('roomSelect');
   var newRoomBtn = document.getElementById('newRoomBtn');
   var delRoomBtn = document.getElementById('delRoomBtn');
+  // 侧边栏：主区顶栏的房间名。阶段 3 起取代原来的 #roomSelect 下拉框
+  var roomTitle = document.getElementById('roomTitle');
+  var roomIdTag = document.getElementById('roomIdTag');
   // Agent 互 @（阶段 4）：协作横幅与停止按钮
   var chainBanner = document.getElementById('chainBanner');
   var chainText = document.getElementById('chainText');
@@ -732,7 +715,6 @@
   function refreshRooms() {
     return loadRooms().then(function (list) {
       rooms = list;
-      renderRoomSelect();
       renderRoomList();   // 侧边栏
       return list;
     });
@@ -802,19 +784,7 @@
     });
   }
 
-  function renderRoomSelect() {
-    roomSelect.innerHTML = '';
-    rooms.forEach(function (r) {
-      var opt = document.createElement('option');
-      opt.value = r.id;
-      // 名字和 id 一样就只显示一次，避免出现 "proj-a（proj-a）" 这种噪音
-      opt.textContent = r.name === r.id ? r.id : r.name + '（' + r.id + '）';
-      roomSelect.appendChild(opt);
-    });
-    roomSelect.value = currentRoom;
-  }
-
-  // 标签页标题、输入框提示、删除按钮可用性都跟着当前房间走
+  // 标签页标题、输入框提示、删除按钮可用性、顶栏房间名都跟着当前房间走
   function applyRoomChrome() {
     var found = null;
     rooms.forEach(function (r) { if (r.id === currentRoom) found = r; });
@@ -822,7 +792,9 @@
     document.title = label + ' · Multi-Agent 聊天室';
     input.placeholder = '在「' + label + '」里发消息，用 @qwen 或 @kimi 召唤 Agent';
     delRoomBtn.disabled = (currentRoom === DEFAULT_ROOM);
-    roomSelect.value = currentRoom;
+    // 侧边栏：顶栏显示当前房间名 + id（id 就是 workspaces/ 下的目录名，排障时很有用）
+    roomTitle.textContent = label;
+    roomIdTag.textContent = found && found.name !== found.id ? found.id : '';
     renderRoomList();   // 侧边栏：高亮必须跟着当前房间走
   }
 
@@ -934,7 +906,6 @@
     });
   }
 
-  roomSelect.addEventListener('change', function () { switchRoom(roomSelect.value); });
   newRoomBtn.addEventListener('click', createRoom);
   delRoomBtn.addEventListener('click', deleteRoom);
 
