@@ -1311,52 +1311,76 @@ function stopChain(roomId) {
   return true;
 }
 
+// Agent 管理：行首 @ 的示范。优先用配置里的 handoffExample（qwen/kimi 是调好的版本），
+// 新建的 Agent 没填时按 role 生成通用示例 —— 保证 prompt 里永远有示范可学，
+// 否则新 Agent 很可能不知道「行首 @」长什么样。
+function handoffExampleFor(me, peerName) {
+  if (me.handoffExample) return me.handoffExample;
+  if (me.role === 'executor') {
+    return `@${peerName} 已完成：改动了 src/x.js 和 src/x.test.js；` +
+      '注意 x.test.js 里有一个用例依赖网络，离线环境会失败。';
+  }
+  if (me.role === 'reviewer') {
+    return `@${peerName} 检查结论：不通过。src/x.js 的手机号分支没有校验长度，请补上后重新交给我。`;
+  }
+  return `@${peerName} 请实现 login() 函数，要求支持邮箱和手机号两种登录方式，写完告诉我改了哪些文件。`;
+}
+
 // 组装发给 Agent 的完整 prompt：角色定义 + 同伴与召唤规则 + 共享对话转录 + 输出约束。
 // 转录内容包含用户输入和其他 Agent 的输出，属于不可信文本，所以用显式定界符包起来。
 // 多房间改造：接收 room，转录只来自这个房间；prompt 里也报出房间名，
 // 让 Agent 知道自己身处哪个讨论上下文。
 // 「主动感知」的要不要插话判断将来也在这里加：给未被 @ 的 Agent 换一段不同的指令即可。
 //
-// Agent 互 @（阶段 1）：注入自己的 systemPrompt、对方的 description 和召唤规则。
-// ⚠️ 这一阶段只改 prompt，路由和调用逻辑没动 —— 所以现在 Agent 会真的输出「@kimi ...」，
-//    但后端还不会因此去调 kimi（那是阶段 2）。验证时看到派活消息却没有后续动作属于预期。
+// Agent 管理（阶段 3）：同伴清单改为**动态**生成 —— 所有 enabled 且非自己的 Agent，
+// 不再硬编码「取第一个」。新增/禁用 Agent 后，其他 Agent 的 prompt 立刻跟着变。
 function buildPrompt(name, room) {
   const { text: transcript, count } = renderTranscript(room);
   const me = AGENTS[name];
-  const roster = Object.values(AGENTS)
-    .map((a) => a.label)
+
+  // Agent 管理：参与者名单只列启用的 Agent —— 禁用者不该出现在「房间里还有谁」里
+  const roster = Object.entries(AGENTS)
+    .filter(([, a]) => a.enabled)
+    .map(([, a]) => a.label)
     .join('、');
 
-  // Agent 互 @：同伴 = 注册表里除自己以外的那些。当前只有两个 Agent，取第一个即可；
-  // 将来若加到三个以上，这里要改成列出全部同伴并放宽「最多 @ 1 个」的规则。
-  const peerEntry = Object.entries(AGENTS).find(([n]) => n !== name);
-  const peerName = peerEntry ? peerEntry[0] : null;
-  const peer = peerEntry ? peerEntry[1] : null;
+  const peers = Object.entries(AGENTS).filter(([n, a]) => a.enabled && n !== name);
+  const peersText = peers.length
+    ? peers.map(([n, a]) => `- @${n}：${a.description}`).join('\n')
+    : '（当前没有其他可召唤的同伴，直接回复用户即可）';
+
+  // Agent 管理：systemPrompt 支持占位符。{{peers}} 若在模板里出现就地替换；
+  // 无论是否出现，同伴清单与召唤规则都会在下面统一追加一份，保证规则永不缺失。
+  const roomContext = `房间「${room.name}」（id=${room.id}）`;
+  const systemPrompt = me.systemPrompt
+    .replaceAll('{{name}}', name)
+    .replaceAll('{{peers}}', peersText)
+    .replaceAll('{{roomContext}}', roomContext);
 
   const lines = [
     '【你的角色】',
-    me.systemPrompt,
+    systemPrompt,
     '',
     `【当前场景】你在名为「${room.name}」的多人聊天室里。` +
       `参与者：一位人类用户，以及 AI Agent（${roster}）。你是「${me.label}」（${name}）。`,
     '',
+    // Agent 管理：同伴清单与召唤规则统一在这里追加，模板里不写死 ——
+    // 否则 N 个模板各写一份规则，改规则时要改 N 处、必然漂移
+    '【你可以召唤的同伴】',
+    peersText,
+    '',
+    '【召唤规则】',
+    '- 只能在回复的**行首**写 @同伴名，句子中间的 @ 不会触发召唤。',
+    '- 一次回复最多 @ 1 个同伴（链条保持线性，调用数才不会指数膨胀）。',
+    `- 不要 @ 自己（你是 ${name}）。`,
+    '- 不需要对方协助时，不要写 @，直接回复即可。',
   ];
 
-  // Agent 互 @：可召唤的同伴只列对方、不列自己 —— 既符合规则，也从源头堵住 @ 自己造成的自循环
-  if (peer) {
-    lines.push(
-      '【你可以召唤的同伴】',
-      `  - @${peerName}：${peer.description}`,
-      '',
-      '【召唤规则】',
-      `- 只能在回复的**行首**写 @${peerName}，句子中间的 @ 不会触发召唤。`,
-      '- 一次回复最多 @ 1 个同伴。',
-      `- 不要 @ 自己（你是 ${name}）。`,
-      '- 不需要对方协助时，不要写 @，直接回复即可。',
-      '- 示例（注意 @ 在行首）：',
-      `  ${me.handoffExample}`,
-      ''
-    );
+  // Agent 互 @：可召唤的同伴不列自己 —— 既符合规则，也从源头堵住 @ 自己造成的自循环
+  if (peers.length) {
+    lines.push('- 示例（注意 @ 在行首）：', `  ${handoffExampleFor(me, peers[0][0])}`, '');
+  } else {
+    lines.push('');
   }
 
   lines.push(
