@@ -172,6 +172,14 @@ function defaultAgents() {
   };
 }
 
+// Agent 管理：systemPrompt 支持的占位符白名单。写错占位符（例如 {{peer}}）
+// 不会报错而是原样留在 prompt 里，很难发现，所以在校验阶段就拦下来。
+const KNOWN_PLACEHOLDERS = new Set(['name', 'peers', 'roomContext']);
+function unknownPlaceholders(text) {
+  const found = String(text).match(/\{\{([a-zA-Z]+)\}\}/g) || [];
+  return [...new Set(found.map((p) => p.slice(2, -2)))].filter((k) => !KNOWN_PLACEHOLDERS.has(k));
+}
+
 // Agent 管理：校验单条配置，返回 { agent } 或 { error }。
 // 规则照需求：name 合法且唯一、script 在预定义列表、role 合法、enabled 为布尔。
 function validateAgentEntry(raw, seenNames) {
@@ -189,6 +197,13 @@ function validateAgentEntry(raw, seenNames) {
   }
   if (typeof raw.systemPrompt !== 'string' || !raw.systemPrompt.trim()) {
     return { error: `${name} 缺少 systemPrompt` };
+  }
+  const badPh = unknownPlaceholders(raw.systemPrompt);
+  if (badPh.length) {
+    return {
+      error: `${name} 的 systemPrompt 含未知占位符：${badPh.map((k) => '{{' + k + '}}').join(', ')}` +
+        '（可用：{{name}} / {{peers}} / {{roomContext}}）',
+    };
   }
 
   seenNames.add(name);
@@ -304,19 +319,187 @@ function scriptPathFor(agent) {
   return path.join(__dirname, s.path);
 }
 
+// Agent 管理：「测试连接」用的一次性 spawn。与 runAgent 分开写，因为：
+//   - 它不需要房间、不写历史、不进协作链，只要「这个脚本能不能跑通」
+//   - 超时固定 10s（坑 3），不能复用 AGENT_TIMEOUT_MS 的 300s，否则一个卡死的
+//     脚本会把测试请求拖住五分钟
+// cwd 用 data/agent-test 而不是项目根：测试脚本同样是个真 Agent，
+// 不能因为它只是「测试」就让它摸到后端源码。
+function runScriptOnce(scriptId, text, timeoutMs) {
+  return new Promise((resolve) => {
+    const s = SCRIPTS.find((x) => x.id === scriptId);
+    if (!s) {
+      resolve({ ok: false, error: `未知脚本 id：${scriptId}` });
+      return;
+    }
+    const cwd = path.join(DATA_DIR, 'agent-test');
+    fs.mkdirSync(cwd, { recursive: true });
+
+    const child = spawn(process.execPath, [path.join(__dirname, s.path), text], {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env,
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* 已退出 */ } }
+    }, timeoutMs);
+
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({ ok: false, error: `无法启动脚本：${err.message}`, stdout: stdout.trim(), stderr });
+    });
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      const out = stdout.trim();
+      if (timedOut) {
+        resolve({ ok: false, error: `超过 ${timeoutMs / 1000}s 未返回，已强制终止`, stdout: out, stderr });
+        return;
+      }
+      if (code === 0 && out) {
+        resolve({ ok: true, stdout: out, stderr });
+        return;
+      }
+      resolve({
+        ok: false,
+        error:
+          `退出码 ${code}${signal ? ` (signal=${signal})` : ''}` +
+          (out ? '' : ' 且没有任何输出') +
+          (stderr.trim() ? `；stderr 尾部：${stderr.trim().slice(-300)}` : ''),
+        stdout: out,
+        stderr,
+      });
+    });
+  });
+}
+
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Agent 管理：返回全部 Agent 的完整配置（含 systemPrompt 与 enabled）。
+// 聊天前端只用 name/label/description/enabled；管理面板需要全文。
+// 本地自用项目，systemPrompt 不算敏感信息，直接返回最省事。
 app.get('/api/agents', (_req, res) => {
-  // Agent 互 @：description 一并暴露出去，阶段 4 前端要用它渲染「qwen 召唤了 kimi」这类标注
   res.json(
     Object.entries(AGENTS).map(([name, a]) => ({
       name,
       label: a.label,
       description: a.description,
+      role: a.role,
+      systemPrompt: a.systemPrompt,
+      script: a.script,
+      enabled: a.enabled,
+      createdAt: a.createdAt,
+      handoffExample: a.handoffExample,
     }))
   );
+});
+
+// Agent 管理：预定义脚本列表。前端下拉只允许从这里选，不允许填任意路径（硬约束）。
+app.get('/api/scripts', (_req, res) => {
+  res.json(SCRIPTS);
+});
+
+// Agent 管理：角色与对应模板。前端选 role 后自动填入 systemPrompt；
+// 「会不会覆盖已编辑内容」的确认在前端做（坑 7）。
+app.get('/api/roles', (_req, res) => {
+  res.json(AGENT_ROLES.map((role) => ({ role, template: ROLE_TEMPLATES[role] })));
+});
+
+// Agent 管理：新增。name 统一转小写（@ 匹配是大小写不敏感的，存小写避免歧义）。
+app.post('/api/agents', (req, res) => {
+  const body = req.body || {};
+  const name = String(body.name || '').trim().toLowerCase();
+  if (AGENTS[name]) {
+    res.status(409).json({ error: `Agent「${name}」已存在` });
+    return;
+  }
+  const { agent, error } = validateAgentEntry({ ...body, name }, new Set(Object.keys(AGENTS)));
+  if (error) {
+    res.status(400).json({ error });
+    return;
+  }
+  AGENTS[name] = agent;
+  saveAgents();
+  console.log(
+    `[agents] 新增 Agent ${name}（role=${agent.role}, script=${agent.script}, enabled=${agent.enabled}）`
+  );
+  res.status(201).json({ name, ...agent });
+});
+
+// Agent 管理：编辑。name 不允许改 —— 它是 @ 标识，历史消息里的 @旧名 会失效（坑 2）。
+app.put('/api/agents/:name', (req, res) => {
+  const name = req.params.name;
+  const existing = AGENTS[name];
+  if (!existing) {
+    res.status(404).json({ error: `Agent「${name}」不存在` });
+    return;
+  }
+  const body = req.body || {};
+  if (body.name !== undefined && String(body.name).trim().toLowerCase() !== name) {
+    res.status(400).json({ error: '不允许修改 name：它是 @ 标识，改了会让历史消息里的 @ 失效' });
+    return;
+  }
+  // 其余字段缺省时沿用现值，允许只改一部分（例如只切换 enabled）
+  const merged = {
+    name,
+    description: body.description !== undefined ? body.description : existing.description,
+    role: body.role !== undefined ? body.role : existing.role,
+    systemPrompt: body.systemPrompt !== undefined ? body.systemPrompt : existing.systemPrompt,
+    script: body.script !== undefined ? body.script : existing.script,
+    enabled: body.enabled !== undefined ? body.enabled : existing.enabled,
+    createdAt: existing.createdAt,
+    handoffExample: body.handoffExample !== undefined ? body.handoffExample : existing.handoffExample,
+  };
+  const seen = new Set(Object.keys(AGENTS).filter((n) => n !== name));
+  const { agent, error } = validateAgentEntry(merged, seen);
+  if (error) {
+    res.status(400).json({ error });
+    return;
+  }
+  AGENTS[name] = agent;
+  saveAgents();
+  console.log(`[agents] 更新 Agent ${name}（enabled=${agent.enabled}, role=${agent.role}）`);
+  res.json({ name, ...agent });
+});
+
+// Agent 管理：删除。有活跃子进程时拒绝（坑 4）。
+// 不级联删除历史消息：旧消息里的 @旧名 只是文本，渲染时找不到对应 Agent 就按原文显示。
+app.delete('/api/agents/:name', (req, res) => {
+  const name = req.params.name;
+  if (!AGENTS[name]) {
+    res.status(404).json({ error: `Agent「${name}」不存在` });
+    return;
+  }
+  if (running.has(name)) {
+    res.status(409).json({ error: `Agent「${name}」有调用正在运行，请等它结束后再删` });
+    return;
+  }
+  delete AGENTS[name];
+  saveAgents();
+  console.log(`[agents] 已删除 Agent ${name}，剩余 ${Object.keys(AGENTS).length} 个`);
+  res.json({ ok: true, deleted: name, remaining: Object.keys(AGENTS).length });
+});
+
+// Agent 管理：测试连接。body: { script, systemPrompt }。
+// 用该脚本 spawn 一次「请回复 OK」，10s 超时（坑 3）。
+// systemPrompt 的占位符校验在 validateAgentEntry 里做，这里只验「脚本通不通」。
+app.post('/api/agents/test', async (req, res) => {
+  const { script } = req.body || {};
+  if (!SCRIPTS.some((s) => s.id === script)) {
+    res.status(400).json({ error: `script 不在预定义列表：${script}` });
+    return;
+  }
+  const result = await runScriptOnce(script, '请回复 OK', 10_000);
+  console.log(`[agents] 测试连接 script=${script} -> ${result.ok ? '成功' : '失败: ' + result.error}`);
+  res.json(result);
 });
 
 // ==================== 多房间改造：房间管理 API ====================
