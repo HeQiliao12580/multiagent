@@ -19,7 +19,12 @@ const express = require('express');
 const { WebSocketServer } = require('ws');
 
 const PORT = Number(process.env.PORT) || 3000;
-const AGENT_TIMEOUT_MS = Number(process.env.AGENT_TIMEOUT_MS) || 120_000;
+// Agent 互 @（阶段 2）：硬上限从 120s 提到 300s。
+// 实测一次协作链里，qwen 在质检轮会用工具反复核验 kimi 的产出（读文件、跑命令、
+// 要求逐字回报 stdout），单轮就跑过了 120s 被强杀，整条链在最后一步断掉。
+// 注意这道闸只在「一个字节输出都没有」时生效 —— 一旦收到过回复文本，
+// 更快的 AGENT_IDLE_MS 静默判定就会接管，所以调大它不会让挂死的 CLI 拖更久。
+const AGENT_TIMEOUT_MS = Number(process.env.AGENT_TIMEOUT_MS) || 300_000;
 // 已经收到回复文本后，再静默这么久就认为 CLI 挂住了，用现有输出收尾
 const AGENT_IDLE_MS = Number(process.env.AGENT_IDLE_MS) || 15_000;
 const MAX_HISTORY = 200;
@@ -45,6 +50,12 @@ const ROOM_ID_RE = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/;
 const MEMORY_MESSAGES = Number(process.env.MEMORY_MESSAGES) || 20; // 最多注入最近多少条
 const MEMORY_MSG_CHARS = Number(process.env.MEMORY_MSG_CHARS) || 600; // 单条消息截断长度
 const MEMORY_MAX_CHARS = Number(process.env.MEMORY_MAX_CHARS) || 6000; // 转录总长度上限
+
+// ---- Agent 互 @（阶段 2）：协作链的循环控制 ----
+// 两个 Agent 互相 @ 是天然死循环，所以这道闸必须先于「Agent 输出能触发调用」上线。
+// 语义：处理某个 Agent 的输出时，如果它自己的 depth 已经 >= MAX_DEPTH 就不再往下传。
+// 因此一条链最多产生 MAX_DEPTH+1 次调用（depth 0..MAX_DEPTH），用户发起的那次算 depth 0。
+const MAX_DEPTH = Number(process.env.MAX_DEPTH) || 4;
 
 // 多房间改造（阶段 3/5）：已不存在全局共享的工作目录，每个 Agent 的 cwd 都是
 // room.workspace（即 workspaces/<roomId>/）。这样既隔离了房间之间的产物，
@@ -247,8 +258,17 @@ app.post('/api/rooms/:id/messages', (req, res) => {
     res.status(400).json({ error: 'text 不能为空' });
     return;
   }
+
+  // Agent 互 @（阶段 2）：dryRun=true 时只解析 @、不调用 Agent、也不写入历史。
+  // 用来验证路由规则（剥代码块、行首匹配、邮箱不误判……）而不烧 token、不污染房间。
+  const mentions = parseMentions(text);
+  if (req.body?.dryRun === true) {
+    res.json({ ok: true, roomId: room.id, mentions, dryRun: true });
+    return;
+  }
+
   handleIncoming(room.id, text, typeof req.body?.sender === 'string' ? req.body.sender : 'curl');
-  res.json({ ok: true, roomId: room.id, mentions: parseMentions(text) });
+  res.json({ ok: true, roomId: room.id, mentions });
 });
 
 // 多房间改造：旧入口保留做兼容，body 里带 roomId 就发到那个房间，不带就发到默认房间。
@@ -434,6 +454,14 @@ function migrateLegacyHistory() {
 }
 
 // ==================== 消息总线（按房间） ====================
+// Agent 互 @（阶段 2）：消息类型从笼统的 message 拆成 user_message / agent_message。
+// 但磁盘上的旧历史全是 message，所以**读取端三种都认、写入端只写新类型** ——
+// 这样不需要迁移任何已有数据，老房间的对话照常加载。
+const MESSAGE_TYPES = new Set(['message', 'user_message', 'agent_message']);
+function isMessageEvent(ev) {
+  return !!ev && MESSAGE_TYPES.has(ev.type);
+}
+
 // 多房间改造（阶段 2）：只投递给订阅了该房间的客户端，房间之间彻底互不可见。
 // 事件体仍带 roomId，前端再做一层兜底过滤，防切换瞬间的竞态串消息。
 function broadcast(roomId, event) {
@@ -445,14 +473,15 @@ function broadcast(roomId, event) {
   }
 }
 
-// 只有 type=message 的事件进历史；status（思考中/出错）是瞬态的，不落库。
+// 只有消息类事件（user_message / agent_message / 旧的 message）进历史；
+// status（思考中/出错/忙）是瞬态的，不落库。
 function publish(roomId, event) {
   const room = getRoom(roomId);
   if (!room) {
     console.error(`[bus] 房间 ${roomId} 不存在，丢弃 ${event.type} 事件`);
     return event;
   }
-  if (event.type === 'message') {
+  if (isMessageEvent(event)) {
     // 常驻服务，每个房间的历史各自封顶，否则内存只涨不落
     room.messages.push(event);
     if (room.messages.length > MAX_HISTORY) {
@@ -481,7 +510,9 @@ function loadRoomHistory(room) {
     if (!line.trim()) continue;
     try {
       const m = JSON.parse(line);
-      if (m && m.type === 'message') room.messages.push(m);
+      // Agent 互 @（阶段 2）：用 isMessageEvent 而不是 === 'message'，
+      // 这样旧格式的历史记录依然能被载入
+      if (isMessageEvent(m)) room.messages.push(m);
     } catch {
       bad++; // 半行/损坏行直接跳过，不能让一条坏数据毁掉整份记忆
     }
@@ -575,9 +606,11 @@ function handleIncoming(roomId, text, sender) {
     return;
   }
 
+  // Agent 互 @（阶段 2）：消息类型从笼统的 message 拆成 user_message / agent_message，
+  // 前后端都据此区分「谁说的」。旧历史里存的还是 message，读取端三种都认。
   publish(roomId, {
     id: crypto.randomUUID(),
-    type: 'message',
+    type: 'user_message',
     from: 'user',
     sender,
     text,
@@ -585,7 +618,9 @@ function handleIncoming(roomId, text, sender) {
   });
 
   // ---------- 这里是 @路由 ----------
-  // 多房间改造：解析逻辑一行未动，只是作用范围限定在当前房间。
+  // 多房间改造：作用范围限定在当前房间。
+  // Agent 互 @（阶段 2）：用户消息走宽松匹配（不要求行首、不限个数），
+  // 严格的「行首 + 最多 1 个 + 排除自己」只用于解析 Agent 输出。
   const targets = parseMentions(text);
 
   if (targets.length === 0) {
@@ -596,18 +631,47 @@ function handleIncoming(roomId, text, sender) {
   // 多个 Agent 并发跑、互不 await，所以一个慢不会挡住另一个；
   // 每个调用各自带超时，卡死只影响它自己，不会拖垮后端事件循环。
   for (const name of targets) {
-    dispatchToAgent(roomId, name).catch((err) => {
+    // 用户直接 @ 的调用一律 depth=0 —— 哪怕 @ 的是 kimi。
+    // kimi 完成后按角色规则 @qwen 交活，那条链同样受 MAX_DEPTH 约束（需求里的第 5 点）。
+    dispatchToAgent(roomId, name, 0, 'user_mention').catch((err) => {
       console.error(`[dispatch:${roomId}/${name}] 未预期的异常:`, err);
     });
   }
 }
 
+// Agent 互 @（阶段 2）：@ 解析重写。
+// 剥离代码块是必须的 —— Agent 回复里经常出现 ```@Override```、```@app.route(...)```
+// 或示例邮箱，不剥掉就会误触发一整条协作链。
+// 未闭合的围栏也要处理（Agent 输出被截断时很常见），所以用 (```|$) 兜底。
+function stripCode(text) {
+  return String(text)
+    .replace(/```[\s\S]*?(```|$)/g, ' ') // 围栏代码块
+    .replace(/`[^`\n]*`/g, ' '); // 行内代码
+}
+
+// opts.lineStartOnly 只认行首的 @（允许前导空格）。Agent 输出用这个模式，
+//   因为注入给它的召唤规则就是「只能在行首写 @同伴名」；用户消息保持宽松匹配，
+//   否则「麻烦 @qwen 看一下」这种正常说法会突然失效。
+// opts.exclude 要排除的 Agent 名。解析 Agent 输出时传它自己，从解析层再堵一次 @ 自己。
+// opts.limit 最多返回几个。Agent 链传 1 —— 规则是最多 @ 1 个同伴，而且链必须保持线性：
+//   一旦允许分支，调用数会指数膨胀，depth 也就失去了约束意义。
+//   用户消息不限，保留「@qwen @kimi 一起看看」这种同时召唤多个的既有能力。
 // 只认注册表里存在的名字，@小明 这种未知提及会被忽略。
-function parseMentions(text) {
+function parseMentions(text, opts = {}) {
+  const { lineStartOnly = false, exclude = null, limit = Infinity } = opts;
+  const source = stripCode(text);
+  const re = lineStartOnly
+    ? /^[ \t]*@([A-Za-z0-9_-]+)/gm
+    : /(?<![\w.])@([A-Za-z0-9_-]+)/g; // 负向后顾排除 foo@qwen.com 这类邮箱
+
   const found = [];
-  for (const match of text.matchAll(/@([A-Za-z0-9_-]+)/g)) {
+  for (const match of source.matchAll(re)) {
     const name = match[1].toLowerCase();
-    if (AGENTS[name] && !found.includes(name)) found.push(name);
+    if (!AGENTS[name]) continue; // 未注册的名字直接忽略
+    if (name === exclude) continue; // 不 @ 自己
+    if (found.includes(name)) continue;
+    found.push(name);
+    if (found.length >= limit) break;
   }
   return found;
 }
@@ -625,63 +689,138 @@ const running = new Set();
 // Agent 脚下被抽掉，结果也会因房间已不存在而被丢弃。
 const inFlightByRoom = new Map();
 
+// Agent 互 @（阶段 2）：新增 depth / triggeredBy 两个参数。
+//   depth        本次调用在协作链里的深度：用户直接 @ 的是 0，每传递一次 +1
+//   triggeredBy  'user_mention'（用户 @）| 'agent_mention'（同伴 @）
+// 需求写的是 runAgent(room, agentName, task, depth)，但 depth 是「编排」概念，
+// runAgent 只是 spawn 包装、拿到 depth 也无处可用，所以挂在这一层。
+//
 // 注意：不需要把用户原话单独传进来 —— handleIncoming 已经先 publish 了这条消息，
 // 所以它此刻就在该房间 messages 的末尾，会作为转录的最后一行被 Agent 看到。
 // 多房间改造：roomId 被闭包捕获，所以即使用户中途切走房间，
-// Agent 的结果仍然会写回发起时的那个房间，不会丢也不会串房（你列的坑 6）。
-async function dispatchToAgent(roomId, name) {
+// Agent 的结果仍然会写回发起时的那个房间，不会丢也不会串房（坑 6）。
+async function dispatchToAgent(roomId, name, depth = 0, triggeredBy = 'user_mention') {
+  // 链条比单次调用活得久，期间房间可能已被 DELETE 掉。
+  // 不先挡住的话，后面 buildPrompt 读 room.name 会直接抛异常。
+  const room = getRoom(roomId);
+  if (!room) {
+    console.error(`[chain:${roomId}] 房间已不存在，丢弃对 ${name} 的调用（depth=${depth}）`);
+    return;
+  }
+
   if (running.has(name)) {
-    console.warn(`[agent:${name}] 正忙，跳过 ${roomId} 的本次调用`);
-    publish(roomId, { type: 'status', agent: name, state: 'busy', ts: Date.now() });
+    console.warn(`[agent:${name}] 正忙，跳过 ${roomId} 的本次调用（depth=${depth}）`);
+    // Agent 互 @：busy 事件带上 depth / triggeredBy。协作链因「忙」断掉时，
+    // 前端才讲得清原因 —— 否则用户只看到派活没人接，完全不知道发生了什么。
+    publish(roomId, {
+      type: 'status',
+      agent: name,
+      state: 'busy',
+      depth,
+      triggeredBy,
+      ts: Date.now(),
+    });
     return;
   }
 
   running.add(name);
   inFlightByRoom.set(roomId, (inFlightByRoom.get(roomId) || 0) + 1);
   const started = Date.now();
-  publish(roomId, { type: 'status', agent: name, state: 'thinking', ts: started });
-
-  // 多房间改造（阶段 3）：room 只取一次，记忆注入和 Agent 的 cwd 都用它，
-  // 避免两处各查一遍 Map 而万一不一致。
-  const room = getRoom(roomId);
+  publish(roomId, {
+    type: 'status',
+    agent: name,
+    state: 'thinking',
+    depth,
+    triggeredBy,
+    ts: started,
+  });
 
   // ---------- 这里是记忆注入 ----------
   // 两个 Agent 是无状态 CLI，共享记忆只能靠把对话转录拼进 prompt。
-  // 多房间改造：只注入当前房间的历史。
+  // 多房间改造：room 只取一次，记忆注入和 Agent 的 cwd 共用，避免两处各查一遍 Map。
   const { prompt, ctxCount } = buildPrompt(name, room);
 
   // 调记忆时很有用：DEBUG_PROMPT=1 npm start，就能看到实际拼给 Agent 的完整 prompt
   if (process.env.DEBUG_PROMPT) {
     console.error(
-      `[prompt:${roomId}/${name}] ${ctxCount} 条历史 / ${prompt.length} 字符\n${prompt}\n[/prompt]`
+      `[prompt:${roomId}/${name} depth=${depth}] ${ctxCount} 条历史 / ${prompt.length} 字符\n${prompt}\n[/prompt]`
     );
   }
+
+  // 留给 finally 之后的链条推进用：只有真正拿到回复才继续传
+  let nextTargets = [];
 
   try {
     const { text, degraded } = await runAgent(room, name, prompt);
     if (degraded) console.warn(`[agent:${roomId}/${name}] 降级返回：${degraded}`);
+
+    // Agent 互 @（阶段 2）：解析回复里的行首 @。
+    // 即使已到深度上限也照样解析 —— 不是为了触发，而是为了能在消息里如实标注
+    // 「协作轮数已达上限」，否则用户只看到链条莫名断掉。
+    const mentioned = parseMentions(text, { lineStartOnly: true, exclude: name, limit: 1 });
+    const atLimit = depth >= MAX_DEPTH;
+    nextTargets = atLimit ? [] : mentioned;
+    const depthLimited = atLimit && mentioned.length > 0;
+
+    if (depthLimited) {
+      console.warn(
+        `[chain:${roomId}] ${name} 在 depth=${depth} 仍想 @${mentioned[0]}，` +
+          `已达 MAX_DEPTH=${MAX_DEPTH}，链条截断`
+      );
+    }
+
     publish(roomId, {
       id: crypto.randomUUID(),
-      type: 'message',
+      type: 'agent_message',
       from: 'agent',
       agent: name,
       label: AGENTS[name].label,
       text,
+      mentions: nextTargets, // 到上限时报空数组：这条消息确实不会再触发任何人
+      triggeredBy,
+      depth,
+      depthLimited,
       degraded: degraded || null,
       ctx: ctxCount, // 本次注入了多少条历史，前端显示出来便于确认记忆生效
       ts: Date.now(),
       ms: Date.now() - started,
     });
   } catch (err) {
-    // Agent 失败只广播错误、不抛出：后端必须继续服务其他消息
+    // Agent 失败只广播错误、不抛出：后端必须继续服务其他消息。
+    // 失败时 nextTargets 保持为空，链条自然终止 —— 不能拿半截输出去触发下一轮。
     console.error(`[agent:${roomId}/${name}] ${err.message}`);
-    publish(roomId, { type: 'status', agent: name, state: 'error', error: err.message, ts: Date.now() });
+    publish(roomId, {
+      type: 'status',
+      agent: name,
+      state: 'error',
+      error: err.message,
+      depth,
+      triggeredBy,
+      ts: Date.now(),
+    });
   } finally {
     running.delete(name);
     const left = (inFlightByRoom.get(roomId) || 1) - 1;
     if (left > 0) inFlightByRoom.set(roomId, left);
     else inFlightByRoom.delete(roomId);
-    publish(roomId, { type: 'status', agent: name, state: 'idle', ts: Date.now() });
+    publish(roomId, {
+      type: 'status',
+      agent: name,
+      state: 'idle',
+      depth,
+      triggeredBy,
+      ts: Date.now(),
+    });
+  }
+
+  // Agent 互 @（阶段 2）：链条推进刻意放在 try/catch/finally 之后 ——
+  // 此时 running 已释放，不会占着自己的锁去等下一个 Agent；
+  // idle 状态也已经发出去了，即使下一轮出问题前端也不会卡在「思考中」。
+  for (const target of nextTargets) {
+    console.log(`[chain:${roomId}] ${name} @${target}，depth ${depth} -> ${depth + 1}`);
+    dispatchToAgent(roomId, target, depth + 1, 'agent_mention').catch((err) => {
+      console.error(`[chain:${roomId}/${target}] 未预期的异常:`, err);
+    });
   }
 }
 

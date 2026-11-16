@@ -235,7 +235,10 @@
     var who = isUser ? (msg.sender || ME) : (msg.label || msg.agent);
     meta.textContent = who + ' · ' + clock(msg.ts)
       + (msg.ms ? ' · ' + (msg.ms / 1000).toFixed(1) + 's' : '')
-      + (msg.ctx ? ' · 记忆 ' + msg.ctx + ' 条' : '');
+      + (msg.ctx ? ' · 记忆 ' + msg.ctx + ' 条' : '')
+      // Agent 互 @（阶段 2）：先给个最小的轮次标记，否则浏览器里看不出
+      // 这条是同伴召唤出来的还是用户直接问的。完整协作 UI 在阶段 4。
+      + (msg.depth > 0 ? ' · 协作第 ' + msg.depth + ' 轮' : '');
 
     var bubble = document.createElement('div');
     bubble.className = 'bubble';
@@ -250,6 +253,15 @@
       warn.className = 'degraded';
       warn.textContent = '\u26a0 ' + msg.degraded;
       row.appendChild(warn);
+    }
+
+    // Agent 互 @（阶段 2）：链条被 MAX_DEPTH 截断时要明确讲出来，
+    // 否则用户只看到「派活了但没人接」，会以为系统坏了。
+    if (msg.depthLimited) {
+      var limited = document.createElement('div');
+      limited.className = 'degraded';
+      limited.textContent = '\u26a0 协作轮数已达上限，链条在此截断';
+      row.appendChild(limited);
     }
 
     log.appendChild(row);
@@ -299,10 +311,17 @@
       (ev.messages || []).forEach(addMessage);
       return;
     }
-    if (ev.type === 'message') { addMessage(ev); return; }
+    // Agent 互 @（阶段 2）：后端把消息类型拆成了 user_message / agent_message，
+    // 但旧历史里存的还是 message —— 三种都要能渲染，否则老房间的对话会整体消失。
+    if (ev.type === 'message' || ev.type === 'user_message' || ev.type === 'agent_message') {
+      addMessage(ev);
+      return;
+    }
     if (ev.type === 'status') {
       if (ev.state === 'thinking') setTyping(ev.agent, true);
-      if (ev.state === 'busy') addNote('[' + ev.agent + '] 正在处理上一条消息，本次调用已跳过');
+      if (ev.state === 'busy') addNote('[' + ev.agent + '] 正在处理上一条消息，本次调用已跳过'
+        // Agent 互 @：协作链撞上并发闸会静默断掉，必须讲明原因
+        + (ev.triggeredBy === 'agent_mention' ? '（协作链在此中断）' : ''));
       if (ev.state === 'error') {
         setTyping(ev.agent, false);
         addNote('[' + ev.agent + '] ' + ev.error);

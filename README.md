@@ -195,13 +195,19 @@ ws://localhost:3000/ws?room=<roomId>
 
 ## Agent 调用层契约
 
-`minimal-qwen.js` / `minimal-kimi.js` 遵循同一套约定，新增 Agent 只要在 `server.js` 的
-`AGENTS` 注册表里加一行：
+`minimal-qwen.js` / `minimal-kimi.js` 遵循同一套约定，新增一个 Agent 只要在 `server.js` 的
+`AGENTS` 注册表里加一项：
 
 ```js
 const AGENTS = {
-  qwen: { script: 'minimal-qwen.js', label: 'Qwen' },
-  kimi: { script: 'minimal-kimi.js', label: 'Kimi' },
+  qwen: {
+    script: 'minimal-qwen.js',   // 调用层脚本
+    label: 'Qwen',               // 界面显示名
+    description: '…',            // 给「同伴」看的职责说明，注入对方 prompt
+    systemPrompt: '…',           // 给「自己」看的角色定义，注入自己 prompt 最前面
+    handoffExample: '@kimi …',   // 行首 @ 的示范，按角色区分「派活」/「交活」写法
+  },
+  kimi: { script: 'minimal-kimi.js', label: 'Kimi', /* 同上 */ },
 };
 ```
 
@@ -213,13 +219,82 @@ const AGENTS = {
 
 ---
 
+## Agent 协作（互 @）
+
+qwen 负责**任务分发与质量检查**，kimi 负责**具体实施**。两者通过回复**行首的 @** 互相召唤，
+后端解析后自动触发下一轮，形成协作链。
+
+```
+用户 @qwen ──depth 0──▶ qwen 派活 "@kimi …"
+                          │
+                       depth 1──▶ kimi 实施（真的会在自己房间的 workspaces/<roomId>/ 下写文件）
+                                    │
+                                 depth 2──▶ kimi 交活 "@qwen …" → qwen 质检 → 达标则总结给用户，链条结束
+```
+
+### @ 解析规则
+
+解析前**先剥离代码块**（围栏 ``` 和行内 `），否则 Agent 回复里的 `@Override`、
+`@app.route(...)`、示例邮箱都会误触发一整条链。未闭合的围栏也会剥（输出被截断时很常见）。
+
+| 来源 | 匹配方式 | 个数 | 排除自己 |
+|---|---|---|---|
+| 用户消息 | 宽松：`@name` 出现在哪都算（但排除 `foo@qwen.com` 这类邮箱） | 不限，可同时召唤多个 | — |
+| Agent 输出 | 严格：**只认行首**（允许前导空格） | 最多 1 个 | 是 |
+
+Agent 输出限制成「行首 + 最多 1 个」是为了让链保持**线性**：一旦允许分支，
+调用数会指数膨胀，depth 也就失去约束意义。只认注册表里的名字，`@小明` 会被忽略。
+
+可以用 `dryRun` 只测解析、不真的调用 Agent（不烧 token、不写历史）：
+
+```bash
+curl -s -X POST localhost:3000/api/rooms/room-default/messages \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"看这段：\n```java\n@kimi\n```","dryRun":true}'
+# → {"ok":true,"roomId":"room-default","mentions":[],"dryRun":true}
+```
+
+### 循环控制
+
+两个 Agent 互相 @ 是天然死循环，所以深度闸**先于**触发能力上线：
+
+- `MAX_DEPTH`（默认 4）：处理某轮输出时，若它自己的 `depth >= MAX_DEPTH` 就不再往下传，
+  消息里标 `depthLimited: true`，前端显示"协作轮数已达上限，链条在此截断"。
+  一条链最多 `MAX_DEPTH + 1` 次调用（用户发起那次算 depth 0）。
+- Agent 调用失败时链条自然终止，不会拿半截输出去触发下一轮。
+- 同一个 Agent 全局仍只允许一个调用在跑；协作链撞上这道闸会断，
+  `busy` 事件带 `triggeredBy: 'agent_mention'`，前端会显示"（协作链在此中断）"。
+- 链条会让房间「有 Agent 在跑」的状态持续更久（实测一条三轮链约 42s，质检轮单独就要 26s），
+  这期间 `DELETE /api/rooms/:id` 会返回 `409`。属预期行为，等链跑完再删。
+
+⚠️ 双 Agent 场景下 `MAX_DEPTH` 已经足以约束来回次数（depth 0→1→2→3→4 就是 4 次来回），
+所以没有再单独实现"同对 Agent 来回最多 N 次"的计数器 —— 加了也是冗余。
+若将来 Agent 数 ≥ 3，链可能分叉，那时才需要按「Agent 对」计数。
+
+### 消息事件新增字段
+
+`agent_message` 事件除原有字段外新增：
+
+| 字段 | 含义 |
+|---|---|
+| `mentions` | 本轮实际会触发的同伴（到达深度上限时为 `[]`） |
+| `triggeredBy` | `user_mention`（用户 @）/ `agent_mention`（同伴 @） |
+| `depth` | 在协作链中的深度，用户直接 @ 的是 0 |
+| `depthLimited` | `true` 表示本轮想继续传但被 `MAX_DEPTH` 截断 |
+
+消息类型也从笼统的 `message` 拆成 `user_message` / `agent_message`。
+**磁盘上的旧历史仍是 `message`，读取端三种都认、写入端只写新类型**，所以不需要迁移数据。
+
+---
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `PORT` | `3000` | 监听端口 |
-| `AGENT_TIMEOUT_MS` | `120000` | Agent 调用硬上限，超时杀进程组 |
+| `AGENT_TIMEOUT_MS` | `300000` | Agent 调用硬上限，超时杀进程组 |
 | `AGENT_IDLE_MS` | `15000` | 已收到回复文本后，再静默这么久就判定 CLI 挂住并降级返回 |
+| `MAX_DEPTH` | `4` | 协作链最大深度，超过就不再传递 @ |
 | `MEMORY_MESSAGES` | `20` | 注入 prompt 的历史条数上限 |
 | `MEMORY_MSG_CHARS` | `600` | 单条历史截断长度 |
 | `MEMORY_MAX_CHARS` | `6000` | 转录总长度上限 |
@@ -227,10 +302,16 @@ const AGENTS = {
 
 `MAX_HISTORY`（每房间内存中保留的消息数，默认 200）是代码常量，未做成环境变量。
 
-调试记忆注入：
+> `AGENT_TIMEOUT_MS` 原先是 120s，做协作链时提到 300s：qwen 在质检轮会用工具反复核验
+> kimi 的产出，单轮就跑过了 120s 被强杀，整条链在最后一步断掉。
+> 这道闸只在「一个字节输出都没有」时生效——一旦收到过回复文本，更快的 `AGENT_IDLE_MS`
+> 就会接管，所以调大它不会让挂死的 CLI 拖更久。
+
+调试 prompt 与记忆注入（二选一）：
 
 ```bash
-DEBUG_PROMPT=1 npm start
+DEBUG_PROMPT=1 npm start                          # 每次真实调用时打印 prompt 到 stderr
+node server.js --print-prompt qwen proj-a         # 不起服务、不花 token，直接打印后退出
 ```
 
 ---
@@ -295,3 +376,12 @@ LLM 分类器会自动放行它认为安全的操作。实测一句"一起看看
 - ✅ 阶段 3：Agent cwd 切到 `room.workspace`
 - ✅ 阶段 4：前端房间下拉切换器 + 新建房间 + 删除房间（含 `DELETE /api/rooms/:id`）
 - ✅ 阶段 5：退役旧的单一 `workspace/`、补 README
+
+**Agent 互 @ 路线**
+
+- ✅ 阶段 1：角色定义写入 `AGENTS`，`buildPrompt` 注入同伴信息与召唤规则
+- ✅ 阶段 2：`parseMentions` 重写（剥代码块 / 行首匹配 / 排除自己）+ 输出触发下一轮调用；
+      `MAX_DEPTH` 循环控制一并落地（原计划的阶段 3，因为深度闸必须先于触发能力上线）
+- ⬜ 阶段 3：剩余的循环控制细化（双 Agent 场景下已被 `MAX_DEPTH` 覆盖，见上文）
+- ⬜ 阶段 4：前端协作可视化 —— 高亮 Agent 之间的 @、标注召唤关系、
+      "协作中…"指示、"停止协作"按钮（目前只有最小标记：`· 协作第 N 轮` 和上限提示）
