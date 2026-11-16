@@ -225,27 +225,74 @@ ws://localhost:3000/ws?room=<roomId>
 
 ## Agent 调用层契约
 
-`minimal-qwen.js` / `minimal-kimi.js` 遵循同一套约定，新增一个 Agent 只要在 `server.js` 的
-`AGENTS` 注册表里加一项：
-
-```js
-const AGENTS = {
-  qwen: {
-    script: 'minimal-qwen.js',   // 调用层脚本
-    label: 'Qwen',               // 界面显示名
-    description: '…',            // 给「同伴」看的职责说明，注入对方 prompt
-    systemPrompt: '…',           // 给「自己」看的角色定义，注入自己 prompt 最前面
-    handoffExample: '@kimi …',   // 行首 @ 的示范，按角色区分「派活」/「交活」写法
-  },
-  kimi: { script: 'minimal-kimi.js', label: 'Kimi', /* 同上 */ },
-};
-```
-
-契约：
+`minimal-qwen.js` / `minimal-kimi.js` 遵循同一套约定。契约：
 
 - `argv[2]` 收提示词
 - **回复写 stdout**，诊断日志写 stderr（所以 `2>/dev/null` 后 stdout 就是纯净回复）
 - 成功时退出码 0
+
+任何满足这套约定的脚本都能成为 Agent 的调用层 —— 但要先在 `server.js` 的 `SCRIPTS`
+常量里登记。这是刻意的硬约束：`agents.json` 里只存脚本 **id** 不存路径，
+所以即使配置文件被改也 spawn 不了任意文件。
+
+---
+
+## Agent 管理（可配置注册表）
+
+Agent 不再硬编码在 `server.js`，而是存在 **`agents.json`**（已 gitignore；
+新克隆会用默认 qwen/kimi 起步），启动时加载进内存。
+
+### 配置模型
+
+```jsonc
+{
+  "agents": [
+    {
+      "name": "qwen",              // 小写字母/数字/连字符，全局唯一，@ 标识
+      "description": "…",          // 给同伴看的职责说明，出现在别人的 @ 清单里
+      "role": "coordinator",       // executor | reviewer | coordinator
+      "systemPrompt": "…",         // 支持 {{name}} / {{peers}} / {{roomContext}} 占位符
+      "script": "qwen",            // SCRIPTS 里的 id，不是路径
+      "enabled": true,
+      "createdAt": 1794000000000,
+      "handoffExample": "@kimi …"  // 可选；缺省时按 role 生成通用示例
+    }
+  ]
+}
+```
+
+`label`（界面显示名）由 name 首字母大写派生，不落盘。
+
+### 管理 API
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/agents` | 全部 Agent 的完整配置（含 systemPrompt / enabled） |
+| POST | `/api/agents` | 新增；重名 409，校验失败 400 带具体原因 |
+| PUT | `/api/agents/:name` | 编辑；**改 name 直接 400**（历史消息里的 @ 会失效） |
+| DELETE | `/api/agents/:name` | 删除；有活跃子进程 409；不级联删历史消息 |
+| POST | `/api/agents/test` | 测试连接：spawn 一次「请回复 OK」，10s 超时 |
+| GET | `/api/scripts` | 预定义脚本列表（前端下拉的唯一来源） |
+| GET | `/api/roles` | 三个角色 + 对应 systemPrompt 模板 |
+
+### 前端管理面板
+
+侧边栏底部「⚙ Agent 管理」打开弹层：列表（编辑 / 禁用启用 / 删除）+ 新增表单。
+
+- script 只能从预定义列表选，不允许填任意路径
+- 选 role 自动填对应模板（**仅新增模式**；用户手动改过 prompt 时会先确认是否覆盖，坑 7）
+- script 或 systemPrompt 相对打开时有改动，必须先通过「测试连接」才能保存
+- 保存后聊天区的 @ 芯片与 mention 高亮候选立即同步；禁用的 Agent 不出现在芯片里
+
+### 兜底与不变量
+
+- `agents.json` 不存在 → 用种子配置生成（种子 = 改造前的 qwen/kimi，prompt 原文保留）
+- 损坏 → 原文件备份为 `agents.json.corrupt-<ts>`，再用种子重建
+- 单条非法（name 不合法/重复、script 不在列表、role 非法、enabled 非布尔、
+  未知占位符）→ 记日志跳过该条，不影响其他 Agent
+- 写入用临时文件 + rename，防并发覆盖
+- **禁用 ≠ 删除**：禁用立即从 @ 清单、路由、前端芯片里消失，正在跑的调用不受影响
+- 同伴清单动态生成（所有 enabled 且非自己）；循环控制只看 `depth`，与 Agent 数量无关
 
 ---
 
@@ -504,6 +551,13 @@ LLM 分类器会自动放行它认为安全的操作。实测一句"一起看看
 - ✅ 阶段 4：前端协作可视化 —— 协作横幅（`协作中… 第 N 轮`）、召唤关系标注
       （`⇄ Qwen 召唤了 Kimi`）、轮数上限提示、**停止协作**按钮
       （`stop_chain` 控制消息 + 后端 `chain_stopped` 确认 + `aborted` 状态）
+
+**Agent 管理路线（2026-11-16 完成）**
+
+- ✅ 阶段 1：`AGENTS` 改为 `agents.json` 驱动（种子迁移、损坏备份重建、单条非法跳过）
+- ✅ 阶段 2：管理 API（CRUD + 测试连接 + `/api/scripts` + `/api/roles`）
+- ✅ 阶段 3：调用路径由注册表驱动（`scriptPathFor`）、同伴清单动态生成、占位符替换
+- ✅ 阶段 4：前端管理面板（列表 / 新增编辑表单 / 测试连接 / 启停删）
 
 **侧边栏改造（前端，2026-11-16 完成）**
 
