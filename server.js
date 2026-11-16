@@ -25,8 +25,15 @@ const PORT = Number(process.env.PORT) || 3000;
 // 注意这道闸只在「一个字节输出都没有」时生效 —— 一旦收到过回复文本，
 // 更快的 AGENT_IDLE_MS 静默判定就会接管，所以调大它不会让挂死的 CLI 拖更久。
 const AGENT_TIMEOUT_MS = Number(process.env.AGENT_TIMEOUT_MS) || 300_000;
-// 已经收到回复文本后，再静默这么久就认为 CLI 挂住了，用现有输出收尾
-const AGENT_IDLE_MS = Number(process.env.AGENT_IDLE_MS) || 15_000;
+// 已经收到回复文本后，再静默这么久就认为 CLI 挂住了，用现有输出收尾。
+// Agent 互 @（阶段 3）：默认从 15s 提到 60s。15s 会误杀正常工作的 qwen ——
+// 实测一次协作链里 qwen 输出一句"我先读一下文件"后进入思考/工具调用，
+// 而 minimal-qwen.js 只把 text 块写 stdout、tool_use 写 stderr，thinking 块被丢弃，
+// 于是两个流同时静默超过 15s，正在干活的 CLI 被当成挂死强杀，回复只剩半句话。
+// 这道闸原本是为了兜 qwen「发完 result 不退出」的问题，而那个问题已经在
+// minimal-qwen.js 里根治（收到 result 就 SIGKILL），所以现在它只是安全网，
+// 放宽到 60s 换来不误杀，代价可控（真挂死时最多多等 60s，且还有硬超时兜底）。
+const AGENT_IDLE_MS = Number(process.env.AGENT_IDLE_MS) || 60_000;
 const MAX_HISTORY = 200;
 
 // ---- 多房间改造：路径布局 ----
@@ -676,6 +683,57 @@ function parseMentions(text, opts = {}) {
   return found;
 }
 
+// Agent 互 @（阶段 3）：@ 解析自检。
+// 严格模式（lineStartOnly / exclude / limit）只在解析 Agent 输出时生效，
+// 走 HTTP 的 dryRun 覆盖不到它 —— 只能靠真实调用烧 token 才碰得到。
+// 所以在这里补一套确定性断言：node server.js --test-mentions
+const MENTION_CASES = [
+  // ---- 严格模式：解析 Agent 输出 ----
+  ['严格 行首 @ 生效', '@kimi 请实现 foo()', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, ['kimi']],
+  ['严格 缩进行的行首也算', '   @kimi 请实现 foo()', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, ['kimi']],
+  ['严格 句中的 @ 不生效', '我觉得这件事应该让 @kimi 来做', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
+  ['严格 多行中只有行首那行生效', '先说明一下情况\n@kimi 干活\n结尾顺便提到 @qwen', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, ['kimi']],
+  ['严格 排除自己（自己 @ 自己不成链）', '@qwen 我自己继续', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
+  ['严格 自己在行首也不算，取后面的同伴', '@qwen 请继续\n@kimi 也看看', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, ['kimi']],
+  ['严格 limit=1 只取第一个', '@kimi 先做\n@qwen 后做', { lineStartOnly: true, exclude: null, limit: 1 }, ['kimi']],
+  ['严格 围栏代码块内的行首 @ 被剥离', '```bash\n@kimi 装饰器\n```', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
+  ['严格 代码块前的行首 @ 仍生效', '@kimi 看下这段\n```python\n@qwen\n```', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, ['kimi']],
+  ['严格 行内代码里的 @ 被剥离', '`@kimi` 是个装饰器', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
+  ['严格 未闭合围栏也要剥', '```python\n@kimi 装饰器', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
+  ['严格 未注册名字忽略', '@gpt 你好', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
+  ['严格 @ 后跟中文标点仍识别', '@kimi：请实现 foo()', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, ['kimi']],
+  ['严格 大写归一化', '@KIMI 请实现', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, ['kimi']],
+  ['严格 行首的邮箱不误判', 'foo@kimi.com 是联系人', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
+  ['严格 @Override 这类注解不误判', '@Override\npublic void run() {}', { lineStartOnly: true, exclude: 'qwen', limit: 1 }, []],
+  // ---- 宽松模式：解析用户消息 ----
+  ['宽松 句中 @ 生效', '麻烦 @kimi 看一下这个', {}, ['kimi']],
+  ['宽松 可同时召唤多个', '@qwen @kimi 一起看看', {}, ['qwen', 'kimi']],
+  ['宽松 邮箱不误判', '发到 foo@qwen.com 这个邮箱', {}, []],
+  ['宽松 代码块内的 @ 被剥离', '看这段：\n```java\n@kimi\n```', {}, []],
+  ['宽松 未注册名字忽略', '@小明 @gpt 在吗', {}, []],
+  ['宽松 纯文本无 @', '今天天气不错', {}, []],
+];
+
+function runMentionTests() {
+  let pass = 0;
+  let fail = 0;
+  for (const [desc, text, opts, expected] of MENTION_CASES) {
+    const got = parseMentions(text, opts);
+    if (JSON.stringify(got) === JSON.stringify(expected)) {
+      pass++;
+      console.log(`  ✅ ${desc}`);
+    } else {
+      fail++;
+      console.log(
+        `  ❌ ${desc}\n       输入: ${JSON.stringify(text)}\n       opts: ${JSON.stringify(opts)}` +
+          `\n       期望: ${JSON.stringify(expected)}\n       实到: ${JSON.stringify(got)}`
+      );
+    }
+  }
+  console.log(`\n=== parseMentions 自检：${pass} 通过 / ${fail} 失败 ===`);
+  return fail === 0;
+}
+
 // 同一个 Agent 同时只允许一个调用在跑。实测：CLI 进程每个约 230MB，且并发打模型
 // 容易触发限流（连发 4 个请求后有 3 个 40s 仍未返回）。忙时直接回「忙」，
 // 之后要排队再换成有界队列。
@@ -1025,45 +1083,57 @@ server.on('error', (err) => {
   process.exit(1);
 });
 
-// 多房间改造：下面的启动顺序有依赖，不要调换
-fs.mkdirSync(WORKSPACES_ROOT, { recursive: true }); // loadRooms 要扫描这个目录
-fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.mkdirSync(ROOMS_DATA_DIR, { recursive: true }); // migrateLegacyHistory / appendHistory 都要往这里写
-
-migrateLegacyHistory(); // 必须在 loadRooms 之前：先搬完旧历史，载入时才看得到
-loadRooms(); // 必须在 listen 之前：WS 客户端一连上就会来要历史
-
-// Agent 互 @（阶段 1）：调试入口 —— 不启动服务，只把拼给某个 Agent 的完整 prompt
-// 打到 stdout 然后退出。这是验证 prompt 注入内容最直接的方式，不用真的调用 CLI、不花 token。
-// 用法：node server.js --print-prompt <agentName> [roomId]
-//   例：node server.js --print-prompt qwen            # 用 room-default 的历史
-//       node server.js --print-prompt kimi proj-a     # 指定房间
-// prompt 走 stdout、统计信息走 stderr，所以 `... > prompt.txt` 拿到的是干净内容。
-const printIdx = process.argv.indexOf('--print-prompt');
-
-if (printIdx !== -1) {
-  const agentName = process.argv[printIdx + 1];
-  const roomId = process.argv[printIdx + 2] || DEFAULT_ROOM_ID;
-
-  if (!AGENTS[agentName]) {
-    console.error(`未知 Agent「${agentName}」，可选：${Object.keys(AGENTS).join(', ')}`);
-    process.exit(1);
-  }
-  const room = getRoom(roomId);
-  if (!room) {
-    console.error(`房间「${roomId}」不存在，现有：${[...rooms.keys()].join(', ')}`);
-    process.exit(1);
-  }
-
-  const { prompt, ctxCount } = buildPrompt(agentName, room);
-  process.stdout.write(prompt + '\n');
-  console.error(
-    `\n--- agent=${agentName}  room=${roomId}  注入 ${ctxCount} 条历史 / 共 ${prompt.length} 字符 ---`
-  );
-  // 故意不调用 process.exit()：stdout 接管道时写入是异步的，立刻退出会截断内容
-  // （minimal-qwen.js 踩过同一个坑）。这里没有 listen、也没有其他活动句柄，
-  // 事件循环排空后进程自然退出。
+// ==================== 启动 ====================
+// 三种运行模式，前两种是调试入口，都不启动服务、不调用 Agent、不花 token：
+//   node server.js --test-mentions                   @ 解析自检（Agent 互 @ 阶段 3）
+//   node server.js --print-prompt <agent> [roomId]   打印拼好的 prompt（Agent 互 @ 阶段 1）
+//   node server.js                                   正常启动常驻服务
+// 自检刻意排在 bootstrap 之前：它不需要房间数据，
+// 也能避免 loadRooms 的「载入 N 条历史」日志混进测试结果里。
+if (process.argv.includes('--test-mentions')) {
+  process.exitCode = runMentionTests() ? 0 : 1;
 } else {
+  bootstrap();
+}
+
+function bootstrap() {
+  // 多房间改造：下面的启动顺序有依赖，不要调换
+  fs.mkdirSync(WORKSPACES_ROOT, { recursive: true }); // loadRooms 要扫描这个目录
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(ROOMS_DATA_DIR, { recursive: true }); // migrateLegacyHistory / appendHistory 都要往这里写
+
+  migrateLegacyHistory(); // 必须在 loadRooms 之前：先搬完旧历史，载入时才看得到
+  loadRooms(); // 必须在 listen 之前：WS 客户端一连上就会来要历史
+
+  const printIdx = process.argv.indexOf('--print-prompt');
+
+  if (printIdx !== -1) {
+    const agentName = process.argv[printIdx + 1];
+    const roomId = process.argv[printIdx + 2] || DEFAULT_ROOM_ID;
+
+    if (!AGENTS[agentName]) {
+      console.error(`未知 Agent「${agentName}」，可选：${Object.keys(AGENTS).join(', ')}`);
+      process.exitCode = 1;
+      return;
+    }
+    const room = getRoom(roomId);
+    if (!room) {
+      console.error(`房间「${roomId}」不存在，现有：${[...rooms.keys()].join(', ')}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const { prompt, ctxCount } = buildPrompt(agentName, room);
+    process.stdout.write(prompt + '\n');
+    console.error(
+      `\n--- agent=${agentName}  room=${roomId}  注入 ${ctxCount} 条历史 / 共 ${prompt.length} 字符 ---`
+    );
+    // 故意不调用 process.exit()：stdout 接管道时写入是异步的，立刻退出会截断内容
+    // （minimal-qwen.js 踩过同一个坑）。这里没有 listen、也没有其他活动句柄，
+    // return 之后事件循环排空，进程带着 exitCode 自然退出。
+    return;
+  }
+
   server.listen(PORT, () => {
     console.log(
       `[multiagent] 前端 http://localhost:${PORT}/?room=<roomId>` +
@@ -1071,7 +1141,7 @@ if (printIdx !== -1) {
     );
     console.log(
       `[multiagent] agents=${Object.keys(AGENTS).join(',')}  硬超时=${AGENT_TIMEOUT_MS}ms` +
-        `  静默判定=${AGENT_IDLE_MS}ms  node=${process.execPath}`
+        `  静默判定=${AGENT_IDLE_MS}ms  协作链 MAX_DEPTH=${MAX_DEPTH}  node=${process.execPath}`
     );
     console.log(
       `[multiagent] 房间 ${rooms.size} 个：${[...rooms.keys()].join(', ')}（默认 ${DEFAULT_ROOM_ID}）`
@@ -1085,7 +1155,8 @@ if (printIdx !== -1) {
         ` / 转录上限 ${MEMORY_MAX_CHARS} 字，落盘 ${ROOMS_DATA_DIR}/<roomId>.jsonl`
     );
     console.log(
-      `[multiagent] 查看拼给 Agent 的完整 prompt：node server.js --print-prompt <agent> [roomId]`
+      `[multiagent] 调试：node server.js --print-prompt <agent> [roomId] 看 prompt` +
+        ` / --test-mentions 跑 @ 解析自检`
     );
   });
 }
