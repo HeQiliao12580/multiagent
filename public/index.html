@@ -421,6 +421,8 @@
   var chainBanner = document.getElementById('chainBanner');
   var chainText = document.getElementById('chainText');
   var stopChainBtn = document.getElementById('stopChainBtn');
+  // 侧边栏：左侧房间列表容器
+  var roomList = document.getElementById('roomList');
 
   var ME = 'user';
   var DEFAULT_ROOM = 'room-default';
@@ -434,9 +436,21 @@
   var chainState = {};   // agentName -> depth，只统计 depth>0 的在跑调用
   var lastHandoff = null; // { from, to }，用来把「kimi 交回给 qwen」这类关系说清楚
 
-  // 多房间改造（阶段 2）：当前房间来自 URL 的 ?room=，缺省用 room-default。
-  // 断线重连必须沿用这个值，绝不能回退到默认房间（否则重连后就串到别的房间了）。
-  var currentRoom = new URLSearchParams(location.search).get('room') || DEFAULT_ROOM;
+  // 侧边栏：记住上次所在的房间。优先级 URL ?room= > localStorage > room-default
+  var STORAGE_KEY = 'multiagent.currentRoom';
+  function rememberedRoom() {
+    // Safari 隐私模式等场景下访问 localStorage 会直接抛异常，必须兜住
+    try { return localStorage.getItem(STORAGE_KEY) || ''; } catch (_) { return ''; }
+  }
+  function rememberRoom(id) {
+    try { localStorage.setItem(STORAGE_KEY, id); } catch (_) { /* 存不下就算了，不影响使用 */ }
+  }
+  function syncUrl() {
+    history.replaceState(null, '', '?room=' + encodeURIComponent(currentRoom));
+  }
+
+  // 多房间改造（阶段 2）：断线重连必须沿用这个值，绝不能回退到默认房间
+  var currentRoom = new URLSearchParams(location.search).get('room') || rememberedRoom() || DEFAULT_ROOM;
   var roomValid = false;   // 房间不存在时置 false，用来掐掉无意义的重连循环
 
   // 消息文本来自 Agent 子进程，属于不可信输入：先整体转义，再叠加 @高亮
@@ -719,7 +733,72 @@
     return loadRooms().then(function (list) {
       rooms = list;
       renderRoomSelect();
+      renderRoomList();   // 侧边栏
       return list;
+    });
+  }
+
+  // 侧边栏：列表区的兜底提示（空列表 / 加载失败）。传 onRetry 时附一个「点击重试」按钮。
+  function listMsg(text, onRetry) {
+    var box = document.createElement('div');
+    box.className = 'room-list-msg';
+    box.textContent = text;
+    if (onRetry) {
+      box.appendChild(document.createElement('br'));
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = '点击重试';
+      btn.addEventListener('click', onRetry);
+      box.appendChild(btn);
+    }
+    return box;
+  }
+
+  // 侧边栏：把房间列表渲染到左侧，当前房间加 .active 高亮。
+  // 每次都整体重绘而不是增量更新 —— 房间数量是个位数到几十的量级，重绘成本可以忽略，
+  // 换来的是「高亮、徽标、顺序」永远和 rooms 数组一致，不会出现增量更新漏改的状态。
+  function renderRoomList() {
+    roomList.innerHTML = '';
+
+    if (!rooms.length) {
+      roomList.appendChild(listMsg('还没有任何房间。点下面的「＋ 新建房间」建一个。'));
+      return;
+    }
+
+    var label = document.createElement('div');
+    label.className = 'room-list-label';
+    label.textContent = '房间 · ' + rooms.length;
+    roomList.appendChild(label);
+
+    rooms.forEach(function (r) {
+      var item = document.createElement('div');
+      item.className = 'room-item' + (r.id === currentRoom ? ' active' : '');
+      item.dataset.room = r.id;
+      item.title = r.name === r.id ? r.id : r.name + '（' + r.id + '）';
+      // 用 div + role 而不是 <a>：切换房间不换页面，语义上是按钮
+      item.setAttribute('role', 'button');
+      item.setAttribute('tabindex', '0');
+
+      var name = document.createElement('span');
+      name.className = 'room-name';
+      name.textContent = r.name === r.id ? r.id : r.name;
+      item.appendChild(name);
+
+      if (r.messageCount) {
+        var badge = document.createElement('span');
+        badge.className = 'room-count';
+        badge.textContent = r.messageCount;
+        badge.title = r.messageCount + ' 条消息';
+        item.appendChild(badge);
+      }
+
+      item.addEventListener('click', function () { switchRoom(r.id); });
+      // 键盘可达性：Tab 聚焦后 Enter / 空格等同点击
+      item.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); switchRoom(r.id); }
+      });
+
+      roomList.appendChild(item);
     });
   }
 
@@ -744,6 +823,7 @@
     input.placeholder = '在「' + label + '」里发消息，用 @qwen 或 @kimi 召唤 Agent';
     delRoomBtn.disabled = (currentRoom === DEFAULT_ROOM);
     roomSelect.value = currentRoom;
+    renderRoomList();   // 侧边栏：高亮必须跟着当前房间走
   }
 
   // 切房间必须先主动关掉旧连接：否则旧房间的在途事件还会往这个页面推，
@@ -753,7 +833,8 @@
     dropSocket();
     currentRoom = roomId;
     roomValid = true;
-    history.replaceState(null, '', '?room=' + encodeURIComponent(roomId));
+    syncUrl();          // 侧边栏：地址栏跟着变，刷新后仍留在同一房间
+    rememberRoom(roomId); // 侧边栏：记住选择，下次打开直接回到这个房间
     // 上一个房间的协作状态（横幅、思考中指示、芯片高亮）必须一起清掉，
     // 否则切走了还挂着「协作中…」
     resetChainUi();
@@ -867,30 +948,49 @@
     chainText.textContent = '正在终止协作…';
   });
 
+  // 侧边栏：启动流程 —— 拉房间列表 → 渲染侧边栏 → 定位初始房间 → 连 WebSocket
   function boot() {
     loadAgents();
+    loadRoomList();
+  }
 
+  function loadRoomList() {
     refreshRooms()
       .then(function (list) {
-        var exists = false;
-        list.forEach(function (r) { if (r.id === currentRoom) exists = true; });
+        // 后端保证 room-default 一定存在，所以正常不会走到这个分支；
+        // 但万一房间被清空，也得给出可读提示而不是白屏
+        if (!list.length) {
+          roomValid = false;
+          dot.className = 'dot';
+          connText.textContent = '无可用房间';
+          addNote('后端没有任何房间，请先新建一个。');
+          return;
+        }
 
-        // URL 指向的房间不存在时不要死连（后端会一直回 400），落回默认房间
+        var exists = list.some(function (r) { return r.id === currentRoom; });
         if (!exists) {
-          addNote('房间「' + currentRoom + '」不存在，已回到默认房间。');
-          currentRoom = DEFAULT_ROOM;
-          history.replaceState(null, '', '?room=' + encodeURIComponent(currentRoom));
+          // 坑 5：localStorage / URL 里记住的房间可能已经被删掉了，
+          // 回退到列表里第一个可用房间（列表按 createdAt 升序，第一个就是最早的）
+          var fallback = list[0].id;
+          addNote('房间「' + currentRoom + '」不存在（可能已被删除），已切到「' + fallback + '」。');
+          currentRoom = fallback;
+          rememberRoom(currentRoom);
+          syncUrl();
         }
 
         roomValid = true;
         log.innerHTML = '';
-        applyRoomChrome();
+        applyRoomChrome();  // 内部会 renderRoomList()，高亮随之落位
         connect();
       })
       .catch(function (err) {
+        // 坑 3：列表加载失败不能只留一个空白侧边栏，要给原因 + 重试入口
         dot.className = 'dot';
-        connText.textContent = '无法获取房间列表';
-        addNote('拉取房间列表失败：' + err.message);
+        connText.textContent = '房间列表加载失败';
+        sendBtn.disabled = true;
+        rooms = [];
+        roomList.innerHTML = '';
+        roomList.appendChild(listMsg('加载房间失败：' + err.message, loadRoomList));
       });
   }
 
