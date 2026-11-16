@@ -5,6 +5,11 @@
 
 Agent 调用不走 API，而是 `spawn` 本地的 `qwen` / `kimi` CLI，因此**不需要任何 API Key**。
 
+> **第一次用、或想换成自己的 CLI（claude / gemini / …）？**
+> 先看 **[QUICKSTART.md](./QUICKSTART.md)** —— 里面有从零跑起来的步骤、
+> 可直接丢给编码助手的 wrapper 生成提示词、三条 wrapper 自检命令，以及排错速查表。
+> 本文档偏参考手册（架构、API、协议、环境变量、已知坑）。
+
 ---
 
 ## 运行
