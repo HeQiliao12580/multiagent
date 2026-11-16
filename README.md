@@ -173,17 +173,28 @@ ws://localhost:3000/ws?room=<roomId>
 
 ## 前端
 
-打开 `http://localhost:3000/`，不带参数即进 `room-default`；
-也可以直接指定 `http://localhost:3000/?room=proj-a`。
+左右分栏布局：左侧深色侧边栏（250px 固定宽）放房间导航，右侧是聊天主区。
+整体锁死 `100vh`，滚动只发生在房间列表和消息区内部，没有页面级滚动条。
 
-### 房间管理（顶栏）
+打开 `http://localhost:3000/`，不带参数即进上次所在的房间（localStorage 记忆）
+或 `room-default`；也可以直接指定 `http://localhost:3000/?room=proj-a`（URL 优先级最高）。
 
-- **下拉框切换房间**：切换时关掉旧 WebSocket → 用新 roomId 重连 → 清空消息区 →
-  由 `history` 事件重新渲染该房间历史。地址栏的 `?room=` 同步更新，刷新后仍在原房间
-- **＋ 新建**：填名称即可。英文名会自动生成 slug 作为 ID；**纯中文名会再弹一次输入框
-  要你补一个英文 ID**（CJK 被剥掉后 slug 就空了，后端只能退化成 `room-N`）。建好自动切进去
-- **删除**：仅对非默认房间可用。二次确认会写明将删除该房间的历史和 `workspaces/<id>/`
-  下所有文件。删完自动回到 `room-default`
+### 侧边栏（房间管理）
+
+- **房间列表**：显示所有房间 + 消息数徽标，当前房间用左侧蓝色边条 + 高亮底色标出。
+  条目可 Tab 聚焦，Enter / 空格等同点击
+- **点击切换**：关掉旧 WebSocket → 用新 roomId 重连 → 清空消息区 → 由 `history` 事件
+  重新渲染该房间历史。地址栏 `?room=` 与 localStorage 同步更新，刷新后仍在同一房间
+- **＋ 新建房间**（侧边栏底部）：填名称即可。英文名自动生成 slug 作为 ID；
+  **纯中文名会再弹一次输入框要你补一个英文 ID**（CJK 被剥掉后 slug 就空了，
+  后端只能退化成 `room-N`）。建好自动切进去。请求在飞时按钮置灰防连点
+- **删除**：主区顶栏房间名右侧，仅对非默认房间可用。二次确认会写明将删除该房间的
+  历史和 `workspaces/<id>/` 下所有文件。删完自动回到 `room-default`
+- **容错**：列表加载失败时侧边栏显示原因 + 「点击重试」；记住的房间已被删除时
+  回退到第一个可用房间并提示，不会对着 400 死连
+
+主区顶栏显示当前房间名 + 房间 id（id 就是 `workspaces/` 下的目录名，排障时直接对得上），
+以及 Agent 芯片（点一下插入 `@qwen` / `@kimi`）和连接状态。
 
 ### 协作可视化
 
@@ -319,7 +330,27 @@ node scripts/stop-chain-test.js
 - `stop-chain-test.js` 不带 roomId 时会自建一次性房间、跑完自动删除；
   指定已有房间则会往里写测试消息和 `stop-a.txt` / `stop-b.txt`
 
-**浏览器**（验证前端协作可视化，改完前端记得硬刷新 Cmd+Shift+R）：
+**无头浏览器自动化**（不需要人点，改完前端必跑）：
+
+```bash
+# 等页面就绪后截图 + 打印 DOM 摘要
+node scripts/ui-check.js "http://localhost:3000/?room=room-default" \
+  "document.querySelectorAll('.room-item').length>0 && document.querySelectorAll('.bubble').length>0" \
+  /tmp/ui.png
+
+# 带交互：点击 proj-a，等切换完成后再截图
+node scripts/ui-check.js "http://localhost:3000/?room=room-default" \
+  "document.querySelectorAll('.room-item').length>0" /tmp/ui.png 45000 \
+  "document.querySelector('.room-item[data-room=\"proj-a\"]').click()" \
+  "document.title.indexOf('proj-a')===0"
+```
+
+它走 Chrome DevTools Protocol，显式轮询就绪条件后才截图。
+Chrome 自带的 `--screenshot --virtual-time-budget` 在 WebSocket 场景下不可靠
+（虚拟时间不等待真实网络握手，实测两次都拍在「连接中…」的空白态），所以别用它验前端。
+需要应答 `prompt()` / `confirm()` 时，在交互 JS 里覆盖 `window.prompt` / `window.confirm` 即可。
+
+**浏览器人工验收**（验证前端协作可视化，改完前端记得硬刷新 Cmd+Shift+R）：
 
 发一条实施类任务，例如 `@qwen 请在当前目录创建 hello.py，打印 hello world，并实际运行一次`，
 应该依次看到：
@@ -473,3 +504,10 @@ LLM 分类器会自动放行它认为安全的操作。实测一句"一起看看
 - ✅ 阶段 4：前端协作可视化 —— 协作横幅（`协作中… 第 N 轮`）、召唤关系标注
       （`⇄ Qwen 召唤了 Kimi`）、轮数上限提示、**停止协作**按钮
       （`stop_chain` 控制消息 + 后端 `chain_stopped` 确认 + `aborted` 状态）
+
+**侧边栏改造（前端，2026-11-16 完成）**
+
+- ✅ 阶段 1：HTML 结构 + CSS 左右分栏（深色侧边栏 250px + 右侧主区，100vh 无页面滚动）
+- ✅ 阶段 2：房间列表加载与渲染（徽标、高亮、localStorage 记忆、失败重试、删房回退）
+- ✅ 阶段 3：移除旧下拉框，切换完全走侧边栏；顶栏改显示房间名 + id
+- ✅ 阶段 4：新建/删除流程收尾 + 防连点
