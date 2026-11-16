@@ -173,6 +173,138 @@
     border-color: var(--accent);
     color: var(--side-fg-strong);
   }
+  /* 侧边栏：Agent 管理入口，放在新建房间按钮上方 */
+  .manage-agents {
+    width: 100%;
+    margin-bottom: 8px;
+    font: inherit;
+    font-size: 13px;
+    padding: 7px 10px;
+    border: 1px solid rgba(255, 255, 255, .14);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--side-fg);
+    cursor: pointer;
+    transition: background .12s, color .12s;
+  }
+  .manage-agents:hover { background: var(--side-bg-soft); color: var(--side-fg-strong); }
+
+  /* Agent 管理：遮罩 + 面板 + 表单 + 列表 */
+  .modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 18, 24, .55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 50;
+  }
+  .modal[hidden] { display: none; }
+  .modal-box {
+    width: min(760px, 94vw);
+    max-height: 86vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, .25);
+    overflow: hidden;
+  }
+  .modal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+    flex: none;
+  }
+  .modal-body { padding: 16px; overflow-y: auto; }
+  .agent-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 8px;
+  }
+  .agent-row .a-main { min-width: 0; }
+  .agent-row .a-name { font-weight: 600; }
+  .agent-row .a-name .badge { margin-left: 8px; font-weight: 400; }
+  .agent-row .a-desc {
+    font-size: 12px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .agent-row .a-actions { margin-left: auto; display: flex; gap: 6px; flex: none; }
+  .badge {
+    flex: none;
+    font-size: 11px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .badge.on { color: #1a7f4b; border-color: #bfe6cf; background: #eafaf0; }
+  .badge.off { color: var(--err); border-color: #e6a99f; background: #fdecea; }
+  .field { display: block; margin-bottom: 12px; font-size: 13px; color: var(--muted); }
+  .field input, .field select, .field textarea {
+    display: block;
+    width: 100%;
+    margin-top: 4px;
+    font: inherit;
+    font-size: 14px;
+    color: var(--text);
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: #fff;
+  }
+  .field textarea {
+    min-height: 170px;
+    resize: vertical;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    line-height: 1.55;
+  }
+  /* 编辑模式下 name 只读：它是 @ 标识，改了历史消息里的 @ 会失效 */
+  .field input:read-only { background: #f2f3f5; color: var(--muted); }
+  .field-row { display: flex; gap: 12px; }
+  .field-row .field { flex: 1; }
+  .form-actions { display: flex; gap: 8px; align-items: center; }
+  .form-hint { font-size: 12px; color: var(--muted); margin-left: auto; }
+  .mini.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .mini.primary:hover { color: #fff; }
+  .mini.primary:disabled { background: #a9c2ef; border-color: #a9c2ef; color: #fff; }
+  .test-result {
+    font-size: 12.5px;
+    margin: 10px 0;
+    padding: 8px 10px;
+    border-radius: 6px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .test-result.ok { background: #eafaf0; border: 1px solid #bfe6cf; color: #1a7f4b; }
+  .test-result.bad { background: #fdecea; border: 1px solid #e6a99f; color: var(--err); }
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    background: #1c1f23;
+    color: #fff;
+    font-size: 13px;
+    padding: 8px 16px;
+    border-radius: 8px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, .3);
+    z-index: 60;
+  }
+  .toast[hidden] { display: none; }
 
   /* 右侧主区顶栏（原来的裸 header 选择器改成类名，避免误伤侧边栏里的元素） */
   .main-head {
@@ -352,6 +484,9 @@
     <!-- 侧边栏：底部新建房间按钮。沿用原来的 #newRoomBtn id，
          所以现有的 createRoom 点击逻辑在阶段 1 就继续生效，功能不断档 -->
     <div class="sidebar-foot">
+      <!-- Agent 管理：入口按钮 -->
+      <button id="agentManageBtn" type="button" class="manage-agents"
+              title="新增 / 编辑 / 启用禁用 / 删除 Agent">⚙ Agent 管理</button>
       <button id="newRoomBtn" type="button" class="new-room" title="新建房间">＋ 新建房间</button>
     </div>
   </aside>
@@ -383,6 +518,62 @@
     </form>
   </main>
 </div>
+
+<!-- Agent 管理：弹层面板。列表视图与表单视图互斥显示 -->
+<div id="agentModal" class="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <span id="agentModalTitle">Agent 管理</span>
+      <button id="agentModalClose" type="button" class="mini">关闭</button>
+    </div>
+    <div class="modal-body">
+      <!-- Agent 管理：列表视图 -->
+      <div id="agentListView">
+        <div class="form-actions" style="margin-bottom:12px">
+          <button id="agentAddBtn" type="button" class="mini primary">＋ 新增 Agent</button>
+          <span class="form-hint">script 只能从预定义列表选；删除不会级联删历史消息</span>
+        </div>
+        <div id="agentList"></div>
+      </div>
+
+      <!-- Agent 管理：新增 / 编辑表单 -->
+      <div id="agentFormView" hidden>
+        <div class="field-row">
+          <label class="field">name（@ 标识，小写字母 / 数字 / 连字符）
+            <input id="afName" autocomplete="off" />
+          </label>
+          <label class="field">role（切换会自动填模板）
+            <select id="afRole"></select>
+          </label>
+        </div>
+        <label class="field">description（一句话说明擅长什么，会出现在别人的 @ 清单里）
+          <input id="afDesc" autocomplete="off" />
+        </label>
+        <label class="field">script（预定义调用脚本，不允许填任意路径）
+          <select id="afScript"></select>
+        </label>
+        <label class="field">systemPrompt（支持 {{name}} / {{peers}} / {{roomContext}} 占位符）
+          <textarea id="afPrompt"></textarea>
+        </label>
+        <label class="field" style="color:var(--text)">
+          <input type="checkbox" id="afEnabled"
+                 style="width:auto;display:inline-block;margin:0 6px 0 0" />
+          enabled（禁用后立即从 @ 清单移除，正在跑的调用不受影响）
+        </label>
+        <div id="afTestResult" class="test-result" hidden></div>
+        <div class="form-actions">
+          <button id="afTestBtn" type="button" class="mini">测试连接</button>
+          <button id="afSaveBtn" type="button" class="mini primary" disabled>保存</button>
+          <button id="afCancelBtn" type="button" class="mini">取消</button>
+          <span id="afHint" class="form-hint"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Agent 管理：操作反馈浮层（保存成功 / 删除成功等） -->
+<div id="toast" class="toast" hidden></div>
 
 <script>
 (function () {
@@ -676,10 +867,13 @@
     fetch('/api/agents')
       .then(function (r) { return r.json(); })
       .then(function (list) {
+        // Agent 管理：禁用的 Agent 不该出现在 @ 芯片和 mention 高亮候选里 ——
+        // 后端路由已经会忽略它们，前端再显示等于给用户一个点了没反应的按钮
+        var active = list.filter(function (a) { return a.enabled; });
         agentsBox.innerHTML = '';
         chips = {};
-        agentNames = list.map(function (a) { return a.name; });
-        list.forEach(function (a) {
+        agentNames = active.map(function (a) { return a.name; });
+        active.forEach(function (a) {
           var chip = document.createElement('button');
           chip.type = 'button';
           chip.className = 'chip';
@@ -917,6 +1111,315 @@
       connect();
     });
   }
+
+  // ==================== Agent 管理（前端面板） ====================
+  var agentManageBtn = document.getElementById('agentManageBtn');
+  var agentModal = document.getElementById('agentModal');
+  var agentModalClose = document.getElementById('agentModalClose');
+  var agentModalTitle = document.getElementById('agentModalTitle');
+  var agentListView = document.getElementById('agentListView');
+  var agentFormView = document.getElementById('agentFormView');
+  var agentAddBtn = document.getElementById('agentAddBtn');
+  var agentList = document.getElementById('agentList');
+  var afName = document.getElementById('afName');
+  var afRole = document.getElementById('afRole');
+  var afDesc = document.getElementById('afDesc');
+  var afScript = document.getElementById('afScript');
+  var afPrompt = document.getElementById('afPrompt');
+  var afEnabled = document.getElementById('afEnabled');
+  var afTestResult = document.getElementById('afTestResult');
+  var afTestBtn = document.getElementById('afTestBtn');
+  var afSaveBtn = document.getElementById('afSaveBtn');
+  var afCancelBtn = document.getElementById('afCancelBtn');
+  var afHint = document.getElementById('afHint');
+  var toast = document.getElementById('toast');
+
+  var agentScripts = [];   // GET /api/scripts
+  var agentRoles = [];     // GET /api/roles -> [{role, template}]
+  var adminAgents = [];    // GET /api/agents 的管理视图缓存
+  var metaLoaded = false;
+  var formMode = 'new';        // 'new' | 'edit'
+  var formEditName = null;     // 编辑模式下的原 name（name 不可改）
+  var formOriginal = null;     // 打开表单时 script/systemPrompt 的快照，判断是否需重新测试
+  var formOriginalRole = null; // 用于「取消覆盖」时把 role 选择还原
+  var testedOk = false;
+  var promptDirty = false;     // 用户是否手动改过 systemPrompt（坑 7 用）
+  var toastTimer = null;
+
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  }
+  function mkBtn(text, fn, danger) {
+    var b = el('button', 'mini' + (danger ? ' danger' : ''), text);
+    b.type = 'button';
+    b.addEventListener('click', fn);
+    return b;
+  }
+  function showToast(text) {
+    toast.textContent = text;
+    toast.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toast.hidden = true; }, 3500);
+  }
+
+  // Agent 管理：脚本列表与角色模板只需拉一次
+  function loadAgentMeta() {
+    if (metaLoaded) return Promise.resolve();
+    return Promise.all([
+      fetch('/api/scripts').then(function (r) { return r.json(); }),
+      fetch('/api/roles').then(function (r) { return r.json(); })
+    ]).then(function (res) {
+      agentScripts = res[0];
+      agentRoles = res[1];
+      afScript.innerHTML = '';
+      agentScripts.forEach(function (s) {
+        var o = document.createElement('option');
+        o.value = s.id;
+        o.textContent = s.id + ' — ' + s.description;
+        afScript.appendChild(o);
+      });
+      afRole.innerHTML = '';
+      agentRoles.forEach(function (r) {
+        var o = document.createElement('option');
+        o.value = r.role;
+        o.textContent = r.role;
+        afRole.appendChild(o);
+      });
+      metaLoaded = true;
+    });
+  }
+
+  function openAgentModal() {
+    agentModal.hidden = false;
+    showListView();
+    loadAgentMeta().then(refreshAgentAdmin).catch(function (e) {
+      agentList.innerHTML = '';
+      agentList.appendChild(el('div', 'room-list-msg', '加载元数据失败：' + e.message));
+    });
+  }
+  function closeAgentModal() { agentModal.hidden = true; }
+  function showListView() {
+    agentListView.hidden = false;
+    agentFormView.hidden = true;
+    agentModalTitle.textContent = 'Agent 管理';
+  }
+
+  function refreshAgentAdmin() {
+    return fetch('/api/agents').then(function (r) { return r.json(); }).then(function (list) {
+      adminAgents = list;
+      renderAgentAdmin();
+    }).catch(function (e) {
+      agentList.innerHTML = '';
+      agentList.appendChild(el('div', 'room-list-msg', '加载 Agent 列表失败：' + e.message));
+    });
+  }
+
+  // Agent 管理：列表行 = name + 启停徽标 + description + role/script + 三个操作按钮
+  function renderAgentAdmin() {
+    agentList.innerHTML = '';
+    if (!adminAgents.length) {
+      agentList.appendChild(el('div', 'room-list-msg', '还没有任何 Agent，点「＋ 新增 Agent」。'));
+      return;
+    }
+    adminAgents.forEach(function (a) {
+      var row = el('div', 'agent-row');
+
+      var main = el('div', 'a-main');
+      var nameLine = el('div', 'a-name', a.name);
+      nameLine.appendChild(el('span', 'badge ' + (a.enabled ? 'on' : 'off'),
+        a.enabled ? '启用' : '禁用'));
+      var desc = el('div', 'a-desc', a.description);
+      desc.title = a.description;
+      main.appendChild(nameLine);
+      main.appendChild(desc);
+      row.appendChild(main);
+
+      row.appendChild(el('span', 'badge', a.role + ' · ' + a.script));
+
+      var actions = el('div', 'a-actions');
+      actions.appendChild(mkBtn('编辑', function () { openAgentForm('edit', a); }));
+      actions.appendChild(mkBtn(a.enabled ? '禁用' : '启用', function () { toggleAgent(a); }));
+      actions.appendChild(mkBtn('删除', function () { deleteAgent(a); }, true));
+      row.appendChild(actions);
+
+      agentList.appendChild(row);
+    });
+  }
+
+  function toggleAgent(a) {
+    api('PUT', '/api/agents/' + encodeURIComponent(a.name), { enabled: !a.enabled })
+      .then(function (res) {
+        if (!res.ok) { showToast('操作失败：' + (res.body.error || res.status)); return; }
+        loadAgents();          // 聊天区的 @ 芯片与高亮候选要同步
+        refreshAgentAdmin();
+        showToast('「' + a.name + '」已' + (a.enabled ? '禁用' : '启用'));
+      })
+      .catch(function (e) { showToast('操作失败：' + e.message); });
+  }
+
+  function deleteAgent(a) {
+    var sure = window.confirm(
+      '确定删除 Agent「' + a.name + '」？\n\n'
+      + '历史消息里的 @' + a.name + ' 会保留为普通文本，但不会再被触发。\n'
+      + '该 Agent 正在运行时会拒绝删除。'
+    );
+    if (!sure) return;
+    api('DELETE', '/api/agents/' + encodeURIComponent(a.name))
+      .then(function (res) {
+        if (res.status === 409) { showToast('「' + a.name + '」有调用正在运行，请等它结束后再删'); return; }
+        if (!res.ok) { showToast('删除失败：' + (res.body.error || res.status)); return; }
+        loadAgents();
+        refreshAgentAdmin();
+        showToast('已删除「' + a.name + '」');
+      })
+      .catch(function (e) { showToast('删除失败：' + e.message); });
+  }
+
+  // Agent 管理：打开表单。new 模式 name 可编辑、选 role 自动填模板；
+  // edit 模式 name 只读（坑 2）、绝不自动填模板（坑 7）
+  function openAgentForm(mode, a) {
+    formMode = mode;
+    promptDirty = false;
+    testedOk = false;
+    afTestResult.hidden = true;
+    afTestResult.textContent = '';
+
+    if (mode === 'new') {
+      agentModalTitle.textContent = '新增 Agent';
+      formEditName = null;
+      afName.value = '';
+      afName.readOnly = false;
+      afDesc.value = '';
+      afRole.value = 'executor';
+      formOriginalRole = 'executor';
+      afScript.value = agentScripts.length ? agentScripts[0].id : '';
+      afPrompt.value = templateFor('executor');
+      afEnabled.checked = true;
+    } else {
+      agentModalTitle.textContent = '编辑 Agent：' + a.name;
+      formEditName = a.name;
+      afName.value = a.name;
+      afName.readOnly = true;
+      afDesc.value = a.description;
+      afRole.value = a.role;
+      formOriginalRole = a.role;
+      afScript.value = a.script;
+      afPrompt.value = a.systemPrompt;
+      afEnabled.checked = a.enabled;
+    }
+    formOriginal = { script: afScript.value, systemPrompt: afPrompt.value };
+    updateSaveState();
+    agentListView.hidden = true;
+    agentFormView.hidden = false;
+  }
+
+  function templateFor(role) {
+    var hit = null;
+    agentRoles.forEach(function (r) { if (r.role === role) hit = r.template; });
+    return hit || '';
+  }
+
+  // Agent 管理：script 或 systemPrompt 相对打开时变了，就必须重新测试连接
+  function needsTest() {
+    if (formMode === 'new') return true;
+    return afScript.value !== formOriginal.script || afPrompt.value !== formOriginal.systemPrompt;
+  }
+  function updateSaveState() {
+    afSaveBtn.disabled = needsTest() && !testedOk;
+    afHint.textContent = afSaveBtn.disabled ? '配置有改动，请先通过「测试连接」' : '';
+  }
+
+  // 坑 7：新增模式下切 role 会填模板；如果用户已经手动改过 prompt，先问要不要覆盖
+  function onRoleChange() {
+    if (formMode !== 'new') return;
+    if (promptDirty &&
+        !window.confirm('切换角色会用模板覆盖当前 systemPrompt，是否继续？')) {
+      afRole.value = formOriginalRole;
+      return;
+    }
+    formOriginalRole = afRole.value;
+    afPrompt.value = templateFor(afRole.value);
+    promptDirty = false;
+    testedOk = false;
+    afTestResult.hidden = true;
+    updateSaveState();
+  }
+
+  function testConnection() {
+    afTestBtn.disabled = true;
+    afTestResult.hidden = false;
+    afTestResult.className = 'test-result';
+    afTestResult.textContent = '测试中…（最多 10s）';
+    api('POST', '/api/agents/test', { script: afScript.value, systemPrompt: afPrompt.value })
+      .then(function (res) {
+        afTestBtn.disabled = false;
+        if (!res.ok) {
+          testedOk = false;
+          afTestResult.className = 'test-result bad';
+          afTestResult.textContent = '请求失败：' + (res.body.error || res.status);
+        } else if (res.body.ok) {
+          testedOk = true;
+          afTestResult.className = 'test-result ok';
+          afTestResult.textContent = '连接成功，返回：' + res.body.stdout;
+        } else {
+          testedOk = false;
+          afTestResult.className = 'test-result bad';
+          afTestResult.textContent = '连接失败：' + res.body.error;
+        }
+        updateSaveState();
+      })
+      .catch(function (e) {
+        afTestBtn.disabled = false;
+        testedOk = false;
+        afTestResult.className = 'test-result bad';
+        afTestResult.textContent = '请求异常：' + e.message;
+        updateSaveState();
+      });
+  }
+
+  function saveAgent() {
+    var payload = {
+      name: afName.value.trim().toLowerCase(),
+      description: afDesc.value.trim(),
+      role: afRole.value,
+      systemPrompt: afPrompt.value,
+      script: afScript.value,
+      enabled: afEnabled.checked
+    };
+    if (!payload.name || !payload.description || !payload.systemPrompt.trim()) {
+      showToast('name / description / systemPrompt 都不能为空');
+      return;
+    }
+    var p = formMode === 'new'
+      ? api('POST', '/api/agents', payload)
+      : api('PUT', '/api/agents/' + encodeURIComponent(formEditName), payload);
+    p.then(function (res) {
+      if (!res.ok) { showToast('保存失败：' + (res.body.error || res.status)); return; }
+      loadAgents();          // 聊天区 @ 芯片与高亮候选同步更新
+      refreshAgentAdmin();
+      showListView();
+      showToast('已保存，新 Agent 已生效');
+    }).catch(function (e) { showToast('保存失败：' + e.message); });
+  }
+
+  agentManageBtn.addEventListener('click', openAgentModal);
+  agentModalClose.addEventListener('click', closeAgentModal);
+  afCancelBtn.addEventListener('click', showListView);
+  agentAddBtn.addEventListener('click', function () { openAgentForm('new'); });
+  afRole.addEventListener('change', onRoleChange);
+  afScript.addEventListener('change', function () {
+    testedOk = false; afTestResult.hidden = true; updateSaveState();
+  });
+  afPrompt.addEventListener('input', function () {
+    promptDirty = true; testedOk = false; updateSaveState();
+  });
+  afTestBtn.addEventListener('click', testConnection);
+  afSaveBtn.addEventListener('click', saveAgent);
+  // 点遮罩空白处关闭面板
+  agentModal.addEventListener('click', function (e) { if (e.target === agentModal) closeAgentModal(); });
 
   newRoomBtn.addEventListener('click', createRoom);
   delRoomBtn.addEventListener('click', deleteRoom);
