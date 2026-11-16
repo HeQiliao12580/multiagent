@@ -1120,6 +1120,8 @@
   var agentListView = document.getElementById('agentListView');
   var agentFormView = document.getElementById('agentFormView');
   var agentAddBtn = document.getElementById('agentAddBtn');
+  // Agent 管理：角色模板是异步拉的，就绪前禁用新增，否则会拿到空模板把 prompt 清空
+  agentAddBtn.disabled = true;
   var agentList = document.getElementById('agentList');
   var afName = document.getElementById('afName');
   var afRole = document.getElementById('afRole');
@@ -1189,6 +1191,7 @@
         afRole.appendChild(o);
       });
       metaLoaded = true;
+      agentAddBtn.disabled = false;   // 模板就绪，可以新增了
     });
   }
 
@@ -1332,16 +1335,35 @@
     afHint.textContent = afSaveBtn.disabled ? '配置有改动，请先通过「测试连接」' : '';
   }
 
-  // 坑 7：新增模式下切 role 会填模板；如果用户已经手动改过 prompt，先问要不要覆盖
+  // 坑 7：选 role 会填模板，但不能静默覆盖用户写过的东西。
+  //   新增模式：只要用户手动改过 prompt 就先确认
+  //   编辑模式：现有 prompt 一定是精心写的，**每次都确认**（原来这里直接 return，
+  //             导致「选了 role 却毫无反应」，等于交互缺陷）
   function onRoleChange() {
-    if (formMode !== 'new') return;
-    if (promptDirty &&
-        !window.confirm('切换角色会用模板覆盖当前 systemPrompt，是否继续？')) {
+    var role = afRole.value;
+    var mustConfirm = formMode === 'edit' || promptDirty;
+
+    if (mustConfirm) {
+      var msg = formMode === 'edit'
+        ? '这是已有 Agent，切换角色会用「' + role + '」的模板覆盖它当前的 systemPrompt。\n\n确定覆盖吗？（覆盖后需要重新通过测试连接才能保存）'
+        : '切换角色会用模板覆盖你刚编辑的 systemPrompt，是否继续？';
+      if (!window.confirm(msg)) {
+        // 还原选择，避免出现「角色显示 reviewer、prompt 还是 coordinator」的错位
+        afRole.value = formOriginalRole;
+        return;
+      }
+    }
+
+    var tpl = templateFor(role);
+    if (!tpl) {
+      // 元数据还没加载完（点得比 fetch 快）时不能拿空串把 prompt 清掉
+      showToast('角色模板尚未加载完成，请稍后重试');
       afRole.value = formOriginalRole;
       return;
     }
-    formOriginalRole = afRole.value;
-    afPrompt.value = templateFor(afRole.value);
+
+    formOriginalRole = role;
+    afPrompt.value = tpl;
     promptDirty = false;
     testedOk = false;
     afTestResult.hidden = true;

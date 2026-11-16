@@ -285,7 +285,9 @@ Agent 不再硬编码在 `server.js`，而是存在 **`agents.json`**（已 giti
 侧边栏底部「⚙ Agent 管理」打开弹层：列表（编辑 / 禁用启用 / 删除）+ 新增表单。
 
 - script 只能从预定义列表选，不允许填任意路径
-- 选 role 自动填对应模板（**仅新增模式**；用户手动改过 prompt 时会先确认是否覆盖，坑 7）
+- 选 role 自动填对应模板：新增模式只在用户手动改过 prompt 时才确认；
+  **编辑模式每次都会确认**（已有 prompt 是调好的，绝不静默覆盖），
+  取消则把角色选择回滚，避免「角色显示 reviewer、prompt 还是 coordinator」的错位
 - script 或 systemPrompt 相对打开时有改动，必须先通过「测试连接」才能保存
 - 保存后聊天区的 @ 芯片与 mention 高亮候选立即同步；禁用的 Agent 不出现在芯片里
 
